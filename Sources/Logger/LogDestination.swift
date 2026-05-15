@@ -1,18 +1,40 @@
 import Foundation
 
 /// Structured representation of a single log event, passed to destinations.
-struct LogEntry: Sendable {
-    let timestamp: Date
-    let level: LogLevel
-    let message: String
-    let metadata: LogMetadata?
-    let correlation: String?
-    let subsystem: String?
-    let fileName: String
-    let function: String
-    let line: Int
+public struct LogEntry: Sendable {
+    public let timestamp: Date
+    public let level: LogLevel
+    public let message: String
+    public let metadata: LogMetadata?
+    public let correlation: String?
+    public let subsystem: String?
+    public let fileName: String
+    public let function: String
+    public let line: Int
 
-    func format() -> String {
+    public init(
+        timestamp: Date = Date(),
+        level: LogLevel,
+        message: String,
+        metadata: LogMetadata? = nil,
+        correlation: String? = nil,
+        subsystem: String? = nil,
+        fileName: String = "",
+        function: String = "",
+        line: Int = 0
+    ) {
+        self.timestamp = timestamp
+        self.level = level
+        self.message = message
+        self.metadata = metadata
+        self.correlation = correlation
+        self.subsystem = subsystem
+        self.fileName = fileName
+        self.function = function
+        self.line = line
+    }
+
+    public func format() -> String {
         let formattedTimestamp = Self.formatTimestamp(timestamp)
 
         var tags = ""
@@ -43,15 +65,20 @@ struct LogEntry: Sendable {
     }
 }
 
-/// Internal protocol for log output backends. Each destination owns its own
+/// Protocol for log output backends. Each destination owns its own
 /// synchronization and receives entries after the global level gate passes.
-protocol LogDestination: Sendable {
+///
+/// Destinations may receive `write()` and `flush()` calls concurrently from
+/// arbitrary threads. Conforming types must handle their own synchronization.
+public protocol LogDestination: Sendable {
     var label: String { get }
     var isEnabled: Bool { get }
+    var minimumLevel: LogLevel? { get }
     func write(_ entry: LogEntry)
     func flush()
 }
 
-extension LogDestination {
+public extension LogDestination {
     func flush() {}
+    var minimumLevel: LogLevel? { nil }
 }

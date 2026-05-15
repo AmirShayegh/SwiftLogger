@@ -11,23 +11,10 @@
 
 <br>
 
-## Output
-
-```
-TRACE | 10:30:45.123 | TokenService.swift:18  | refresh initiated
-DEBUG | 10:30:45.200 | APIClient.swift:88     | cache miss for /home
- INFO | 10:30:45.300 | AppDelegate.swift:15   | application launched
- WARN | 10:30:46.010 | TokenService.swift:91  | token expires in < 60s
-ERROR | 10:30:46.500 | NetworkLayer.swift:203  | request failed: 503
- TODO | 10:30:47.000 | SyncWorker.swift:42    | implement retry backoff
-```
-
-Single line. Fixed-width level tags. No decoration.
-
 ## Install
 
 ```swift
-.package(url: "https://github.com/AmirShayegh/SwiftLogger.git", from: "1.0.0")
+.package(url: "https://github.com/AmirShayegh/SwiftLogger.git", from: "2.1.0")
 ```
 
 ```swift
@@ -64,17 +51,16 @@ Log.minimumLevel(.info)
 | `minimumLevel(_:)` | `.debug` | Messages below this level are discarded |
 | `consoleLogging(_:)` | `true` | Toggle `print()` output |
 | `fileLogging(_:)` | `false` | Toggle file output to `Documents/app.log`. Check `isFileLoggingActive` to verify. |
+| `fileLogging(url:label:minimumLevel:rotation:)` | -- | File logging to a custom URL with optional rotation |
 | `logLevel(_:forFile:)` | -- | Override level for a specific source file |
-| `resetLogLevel(forFile:)` | -- | Remove a per-file override |
 | `highlight(_:)` | -- | Prefix output from a file with `>>>` |
-| `removeHighlight(_:)` | -- | Remove the `>>>` prefix |
 | `installExceptionHandler()` | off | Log uncaught `NSException`s. Chains to previous handler. Idempotent. |
 
 ## Levels
 
 `verbose` < `debug` < `info` < `warning` < `error` < `todo`
 
-Messages below the effective minimum are discarded. `@autoclosure` ensures filtered messages allocate nothing.
+Messages below the effective minimum are discarded.
 
 ## Subsystems
 
@@ -90,8 +76,6 @@ Log("parsed body", level: .debug, subsystem: "network.api")  // uses own .debug
 
 Resolution order: exact subsystem match > parent subsystem > per-file override > global minimum.
 
-Use `resetSubsystem(_:)` to remove a subsystem level.
-
 ## Scoped Loggers
 
 Tag concurrent work with correlation IDs.
@@ -102,14 +86,7 @@ job.info("started")
 job.debug("record processed", metadata: ["count": 42])
 ```
 
-```
- INFO | 10:30:45.123 | SyncWorker.swift:42 | [job-abc123] [sync] started
-DEBUG | 10:30:45.200 | SyncWorker.swift:55 | [job-abc123] [sync] record processed {count=42}
-```
-
-Scoped loggers are `Sendable` value types with convenience methods for each level (`.verbose()`, `.debug()`, `.info()`, `.warning()`, `.error()`, `.todo()`).
-
-They nest -- a child inherits the parent's subsystem unless overridden:
+Scoped loggers are `Sendable` value types with convenience methods for each level. They nest -- a child inherits the parent's subsystem unless overridden.
 
 ```swift
 let pipeline = Log.scoped(correlation: "pipeline-1", subsystem: "pipeline")
@@ -125,15 +102,118 @@ Type-safe key-value pairs via `LogValue`. Supports string, integer, float, and b
 Log("request done", metadata: ["status": 200, "cached": false, "ms": 142.5, "path": "/home"])
 ```
 
-```
- INFO | 10:30:45.300 | APIClient.swift:88 | request done {cached=false, ms=142.5, path=/home, status=200}
+Metadata keys are sorted alphabetically in the output.
+
+## Custom Destinations
+
+Implement the `LogDestination` protocol to send logs anywhere -- a database, a network service, or an analytics pipeline.
+
+```swift
+final class MyDestination: LogDestination, @unchecked Sendable {
+    let label = "my-dest"
+    var isEnabled: Bool { true }
+    var minimumLevel: LogLevel? { .warning }
+
+    func write(_ entry: LogEntry) {
+        // entry.level, entry.message, entry.metadata, entry.subsystem, etc.
+    }
+}
 ```
 
-Metadata keys are sorted alphabetically in the output.
+Register and remove destinations by label:
+
+```swift
+Log.addDestination(MyDestination())
+Log.removeDestination(label: "my-dest")
+```
+
+`addDestination` replaces any existing destination with the same label. Destinations must be `Sendable` and handle their own synchronization -- `write()` and `flush()` may be called concurrently from arbitrary threads.
+
+### Per-Destination Level Filtering
+
+Each destination can declare a `minimumLevel`. Messages that pass the global gate but fall below a destination's minimum are skipped for that destination.
+
+```swift
+let console = ConsoleDestination(minimumLevel: .debug)
+let file = FileDestination(url: logURL, minimumLevel: .warning)!
+
+Log.addDestination(console)
+   .addDestination(file)
+
+Log("verbose detail", level: .debug)   // console only
+Log("disk-worthy warning", level: .warning) // both
+```
+
+### Built-in Destinations
+
+| Destination | Label | Description |
+|---|---|---|
+| `ConsoleDestination` | `"console"` | `print()` output + optional test sink. Always present by default. |
+| `FileDestination` | `"file"` | Persistent `FileHandle` with async writes on a serial queue. |
+| `OSLogDestination` | `"oslog"` | Apple's unified logging via modern `os.Logger` API. |
+
+## File Logging
+
+Basic file logging to `Documents/app.log`:
+
+```swift
+Log.fileLogging(true)
+```
+
+File logging to a custom URL with rotation:
+
+```swift
+let logURL = documentsDir.appendingPathComponent("myapp.log")
+Log.fileLogging(
+    url: logURL,
+    rotation: FileRotationConfig(maxFileSize: 5_000_000, maxArchivedFilesCount: 3)
+)
+```
+
+`maxFileSize` is a soft post-write threshold -- a file may exceed it by one entry. Archives are named with a UTC timestamp and short UUID (e.g. `myapp.log.20250515T121530Z_a1b2c3d4`) and pruned to `maxArchivedFilesCount`. Set `maxArchivedFilesCount` to `0` to retain no archives.
+
+The file handle is kept open for the lifetime of the destination -- no open/close overhead per write.
+
+## OSLog
+
+Route logs to Apple's unified logging system alongside your custom destinations.
+
+```swift
+Log.osLogDestination(subsystem: Bundle.main.bundleIdentifier!, category: "networking")
+```
+
+Or add directly:
+
+```swift
+Log.addDestination(OSLogDestination(subsystem: "com.myapp", category: "sync", minimumLevel: .info))
+```
+
+Level mapping: verbose/debug -> `.debug`, info -> `.info`, warning -> `.default`, error -> `.error`, todo -> `.fault`. All content is logged with public privacy. Available on Apple platforms only.
+
+## swift-log Integration
+
+SwiftLogger includes a `LogHandler` for Apple's [swift-log](https://github.com/apple/swift-log) ecosystem. Messages from swift-log are routed through the full destination pipeline with subsystem filtering -- the swift-log `label` becomes the subsystem.
+
+```swift
+import Logging
+import Logger
+
+LoggingSystem.bootstrap { label in
+    SwiftLogHandler(label: label)
+}
+
+// Now any swift-log Logger routes through SwiftLogger's destinations
+let logger = Logger(label: "com.myapp.network")
+logger.info("request sent")
+```
+
+Level mapping: trace -> verbose, debug -> debug, info -> info, notice -> info, warning -> warning, error -> error, critical -> todo. Metadata is bridged to `LogMetadata` with all values converted to strings.
 
 ## Thread Safety
 
-All logger state is lock-protected. Each log destination manages its own synchronization. `ScopedLogger` is a `Sendable` value type with no mutable state. File writes are serialized on a dedicated dispatch queue. `DateFormatter` instances are thread-local to avoid contention.
+All logger state is lock-protected. Each destination manages its own synchronization. `ScopedLogger` is a `Sendable` value type. File writes are serialized on a dedicated dispatch queue. `DateFormatter` instances are thread-local to avoid contention.
+
+Custom destinations must be `Sendable`. `write()` and `flush()` may be called concurrently from arbitrary threads.
 
 ## License
 

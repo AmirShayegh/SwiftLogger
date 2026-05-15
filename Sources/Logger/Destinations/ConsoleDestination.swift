@@ -1,13 +1,18 @@
 import Foundation
 
-final class ConsoleDestination: LogDestination, @unchecked Sendable {
-    let label = "console"
+public final class ConsoleDestination: LogDestination, @unchecked Sendable {
+    public let label = "console"
     private let lock = NSLock()
     private var _printEnabled = true
     private var _outputSink: ((String) -> Void)?
     private var _highlightedFiles: Set<String> = []
+    private var _minimumLevel: LogLevel?
 
-    var isEnabled: Bool {
+    public init(minimumLevel: LogLevel? = nil) {
+        self._minimumLevel = minimumLevel
+    }
+
+    public var isEnabled: Bool {
         lock.lock()
         let hasSink = _outputSink != nil
         let printOn = _printEnabled
@@ -15,12 +20,17 @@ final class ConsoleDestination: LogDestination, @unchecked Sendable {
         return printOn || hasSink
     }
 
-    var printEnabled: Bool {
+    public var minimumLevel: LogLevel? {
+        get { lock.lock(); defer { lock.unlock() }; return _minimumLevel }
+        set { lock.lock(); _minimumLevel = newValue; lock.unlock() }
+    }
+
+    public var printEnabled: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _printEnabled }
         set { lock.lock(); _printEnabled = newValue; lock.unlock() }
     }
 
-    func write(_ entry: LogEntry) {
+    public func write(_ entry: LogEntry) {
         var line = entry.format()
 
         lock.lock()
@@ -41,25 +51,25 @@ final class ConsoleDestination: LogDestination, @unchecked Sendable {
         }
     }
 
-    func setOutputSink(_ sink: ((String) -> Void)?) {
+    internal func setOutputSink(_ sink: ((String) -> Void)?) {
         lock.lock()
         _outputSink = sink
         lock.unlock()
     }
 
-    func highlight(_ fileName: String) {
+    public func highlight(_ fileName: String) {
         lock.lock()
         _highlightedFiles.insert(fileName)
         lock.unlock()
     }
 
-    func removeHighlight(_ fileName: String) {
+    public func removeHighlight(_ fileName: String) {
         lock.lock()
         _highlightedFiles.remove(fileName)
         lock.unlock()
     }
 
-    func resetHighlights() {
+    internal func resetHighlights() {
         lock.lock()
         _highlightedFiles.removeAll()
         lock.unlock()

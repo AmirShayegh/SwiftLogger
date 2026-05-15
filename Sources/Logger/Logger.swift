@@ -122,6 +122,27 @@ public final class Logger: @unchecked Sendable {
         return self
     }
 
+    /// Enables file logging to a specific URL with optional configuration.
+    @discardableResult
+    public func fileLogging(
+        url: URL,
+        label: String = "file",
+        minimumLevel: LogLevel? = nil,
+        rotation: FileRotationConfig? = nil
+    ) -> Logger {
+        lock.lock()
+        _destinations.removeAll(where: { $0.label == label })
+        if let fd = FileDestination(url: url, label: label, minimumLevel: minimumLevel, rotationConfig: rotation) {
+            _destinations.append(fd)
+        } else {
+            lock.unlock()
+            print("[Logger] Failed to enable file logging — could not open \(url.path)")
+            return self
+        }
+        lock.unlock()
+        return self
+    }
+
     /// Overrides the minimum log level for messages originating from `fileName`.
     ///
     /// The file name is matched against the last path component of `#file`
@@ -215,6 +236,49 @@ public final class Logger: @unchecked Sendable {
         return self
     }
 
+    // MARK: - Custom Destinations
+
+    /// Registers a custom log destination.
+    ///
+    /// If a destination with the same `label` already exists, it is replaced.
+    @discardableResult
+    public func addDestination(_ destination: any LogDestination) -> Logger {
+        lock.lock()
+        _destinations.removeAll(where: { $0.label == destination.label })
+        _destinations.append(destination)
+        lock.unlock()
+        return self
+    }
+
+    /// Removes a destination by label.
+    @discardableResult
+    public func removeDestination(label: String) -> Logger {
+        lock.lock()
+        _destinations.removeAll(where: { $0.label == label })
+        lock.unlock()
+        return self
+    }
+
+    // MARK: - OSLog Convenience
+
+    #if canImport(os)
+    /// Adds an OSLog destination. Convenience for `addDestination(OSLogDestination(...))`.
+    @discardableResult
+    public func osLogDestination(
+        subsystem: String,
+        category: String,
+        label: String = "oslog",
+        minimumLevel: LogLevel? = nil
+    ) -> Logger {
+        addDestination(OSLogDestination(
+            subsystem: subsystem,
+            category: category,
+            label: label,
+            minimumLevel: minimumLevel
+        ))
+    }
+    #endif
+
     // MARK: - Scoped Loggers
 
     /// Creates a lightweight ``ScopedLogger`` that tags every message with a
@@ -256,7 +320,7 @@ public final class Logger: @unchecked Sendable {
         function: String = #function,
         line: Int = #line
     ) {
-        _log(message, level: level, subsystem: subsystem, metadata: metadata, correlation: correlation, file: file, function: function, line: line)
+        logMessage(message, level: level, subsystem: subsystem, metadata: metadata, correlation: correlation, file: file, function: function, line: line)
     }
 
     // MARK: - Logging
@@ -275,14 +339,14 @@ public final class Logger: @unchecked Sendable {
         function: String = #function,
         line: Int = #line
     ) {
-        _log(message, level: level, subsystem: subsystem, metadata: metadata, correlation: correlation, file: file, function: function, line: line)
+        logMessage(message, level: level, subsystem: subsystem, metadata: metadata, correlation: correlation, file: file, function: function, line: line)
     }
 
-    // MARK: - Internal Log (closure-forwarding entry point)
+    // MARK: - Integration Entry Point
 
-    // internal (not private) so ScopedLogger and global functions can forward
-    // the @autoclosure as a plain closure without forcing evaluation.
-    internal func _log(
+    // Public so bridge modules (SwiftLogHandler, ScopedLogger, global functions)
+    // can forward the @autoclosure as a plain closure without forcing evaluation.
+    public func logMessage(
         _ message: () -> String,
         level: LogLevel = .info,
         subsystem: String? = nil,
@@ -302,7 +366,12 @@ public final class Logger: @unchecked Sendable {
         lock.unlock()
 
         guard level >= effectiveLevel else { return }
-        guard destinations.contains(where: { $0.isEnabled }) else { return }
+
+        // Check isEnabled and minimumLevel outside the lock
+        let hasActiveDestination = destinations.contains { dest in
+            dest.isEnabled && (dest.minimumLevel.map { level >= $0 } ?? true)
+        }
+        guard hasActiveDestination else { return }
 
         let entry = LogEntry(
             timestamp: Date(),
@@ -317,6 +386,7 @@ public final class Logger: @unchecked Sendable {
         )
 
         for destination in destinations where destination.isEnabled {
+            if let destMin = destination.minimumLevel, level < destMin { continue }
             destination.write(entry)
         }
     }
@@ -375,30 +445,30 @@ public let Log = Logger.shared
 
 /// Logs a message at `.verbose` level.
 public func logVerbose(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
-    Log._log(message, level: .verbose, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
+    Log.logMessage(message, level: .verbose, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.debug` level.
 public func logDebug(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
-    Log._log(message, level: .debug, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
+    Log.logMessage(message, level: .debug, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.info` level.
 public func logInfo(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
-    Log._log(message, level: .info, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
+    Log.logMessage(message, level: .info, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.warning` level.
 public func logWarning(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
-    Log._log(message, level: .warning, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
+    Log.logMessage(message, level: .warning, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.error` level.
 public func logError(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
-    Log._log(message, level: .error, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
+    Log.logMessage(message, level: .error, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.todo` level — marks incomplete work.
 public func logTODO(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
-    Log._log(message, level: .todo, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
+    Log.logMessage(message, level: .todo, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
