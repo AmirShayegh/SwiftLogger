@@ -1,45 +1,56 @@
-# Logger
+<p align="center">
+  <img src="extra/banner.png" alt="SwiftLogger" width="100%">
+</p>
 
-A thread-safe Swift logging library with hierarchical subsystems, scoped correlation IDs, structured metadata, and a fluent configuration API.
+<p align="center">
+  <img src="https://img.shields.io/badge/Swift-5.9+-F05138?style=flat&logo=swift&logoColor=white" alt="Swift 5.9+">
+  <img src="https://img.shields.io/badge/Platforms-iOS%2015+%20|%20macOS%2012+-333333?style=flat" alt="Platforms">
+  <img src="https://img.shields.io/badge/SPM-Compatible-4FC08D?style=flat" alt="SPM Compatible">
+  <img src="https://img.shields.io/badge/License-MIT-blue?style=flat" alt="License">
+</p>
 
-## Installation
+<br>
 
-Add the package to your `Package.swift`:
+## Output
 
-```swift
-dependencies: [
-    .package(url: "https://github.com/user/Logger.git", from: "1.0.0")
-]
+```
+TRACE | 10:30:45.123 | TokenService.swift:18  | refresh initiated
+DEBUG | 10:30:45.200 | APIClient.swift:88     | cache miss for /home
+ INFO | 10:30:45.300 | AppDelegate.swift:15   | application launched
+ WARN | 10:30:46.010 | TokenService.swift:91  | token expires in < 60s
+ERROR | 10:30:46.500 | NetworkLayer.swift:203  | request failed: 503
+ TODO | 10:30:47.000 | SyncWorker.swift:42    | implement retry backoff
 ```
 
-Then add `"Logger"` to your target's dependencies:
+Single line. Fixed-width level tags. No decoration.
+
+## Install
+
+```swift
+.package(url: "https://github.com/AmirShayegh/SwiftLogger.git", from: "1.0.0")
+```
 
 ```swift
 .target(name: "MyApp", dependencies: ["Logger"])
 ```
 
-**Platforms:** iOS 15+, macOS 12+
-**Swift:** 5.9+
-
-## Quick Start
+## Usage
 
 ```swift
 import Logger
 
-// Log a message (defaults to .info level)
 Log("app launched")
-
-// Log with a specific level
 Log("cache miss", level: .warning)
 
-// Global convenience functions
 logDebug("request sent")
 logError("connection failed")
 ```
 
+Message expressions are `@autoclosure` -- interpolations and other message work are not evaluated when the level is filtered out.
+
 ## Configuration
 
-All configuration methods return `self` for chaining and can be called at any time:
+All configuration methods return `self` for chaining:
 
 ```swift
 Log.minimumLevel(.info)
@@ -48,79 +59,57 @@ Log.minimumLevel(.info)
    .installExceptionHandler()
 ```
 
-### Options
-
 | Method | Default | Description |
 |---|---|---|
-| `minimumLevel(_:)` | `.debug` | Global severity threshold. Messages below this level are discarded. |
-| `consoleLogging(_:)` | `true` | Toggles `print()` output. |
-| `fileLogging(_:)` | `false` | Toggles writing to `Documents/app.log`. The file handle is created lazily. Check `isFileLoggingActive` to verify it opened successfully. |
-| `installExceptionHandler()` | off | Installs an `NSUncaughtExceptionHandler` that logs the crash and flushes to the log file. Chains to any previously installed handler. Idempotent. |
+| `minimumLevel(_:)` | `.debug` | Messages below this level are discarded |
+| `consoleLogging(_:)` | `true` | Toggle `print()` output |
+| `fileLogging(_:)` | `false` | Toggle file output to `Documents/app.log`. Check `isFileLoggingActive` to verify. |
+| `logLevel(_:forFile:)` | -- | Override level for a specific source file |
+| `resetLogLevel(forFile:)` | -- | Remove a per-file override |
+| `highlight(_:)` | -- | Prefix output from a file with `>>>` |
+| `removeHighlight(_:)` | -- | Remove the `>>>` prefix |
+| `installExceptionHandler()` | off | Log uncaught `NSException`s. Chains to previous handler. Idempotent. |
 
-## Log Levels
+## Levels
 
-Levels are ordered by severity. The logger discards any message below the effective minimum.
+`verbose` < `debug` < `info` < `warning` < `error` < `todo`
 
-| Level | Emoji | Typical Use |
-|---|---|---|
-| `.verbose` | `🟣` | Fine-grained tracing (decode loops, packet reads) |
-| `.debug` | `🔵` | Development diagnostics |
-| `.info` | `🟢` | Normal operational events |
-| `.warning` | `⚠️` | Recoverable issues worth attention |
-| `.error` | `⛔️` | Failures |
-| `.todo` | `🚧` | Marks incomplete work. Highest severity so it always surfaces. |
+Messages below the effective minimum are discarded. `@autoclosure` ensures filtered messages allocate nothing.
 
-## Subsystem Hierarchy
+## Subsystems
 
-Subsystems are logical categories independent of file names. They support dot-separated hierarchy so a parent level applies to all descendants unless overridden:
+Dot-separated hierarchy. A parent level applies to all children unless overridden.
 
 ```swift
-Log.subsystem("ffmpeg", level: .info)
-   .subsystem("ffmpeg.decoder", level: .debug)
+Log.subsystem("network", level: .info)
+   .subsystem("network.api", level: .debug)
 
-Log("packet read", level: .info, subsystem: "ffmpeg.demuxer")
-// "ffmpeg.demuxer" has no explicit level -> walks up to "ffmpeg" -> .info -> passes
-
-Log("frame decoded", level: .debug, subsystem: "ffmpeg.decoder")
-// "ffmpeg.decoder" has explicit .debug -> passes
-
-Log("encoding stats", level: .debug, subsystem: "ffmpeg.encoder")
-// walks up to "ffmpeg" -> .info -> .debug < .info -> filtered
+Log("request sent", subsystem: "network.socket")   // inherits .info from "network"
+Log("parsed body", level: .debug, subsystem: "network.api")  // uses own .debug
 ```
 
-### Level Resolution Order
+Resolution order: exact subsystem match > parent subsystem > per-file override > global minimum.
 
-When a log message is emitted, the effective minimum level is determined by:
-
-1. **Subsystem level** (exact match, then walk up the hierarchy)
-2. **Per-file override** (`logLevel(_:forFile:)`)
-3. **Global minimum** (`minimumLevel(_:)`)
-
-The first match wins.
+Use `resetSubsystem(_:)` to remove a subsystem level.
 
 ## Scoped Loggers
 
-When multiple jobs run concurrently, scoped loggers tag every message with a correlation ID so you can tell them apart:
+Tag concurrent work with correlation IDs.
 
 ```swift
-let job = Log.scoped(correlation: "job-\(id)", subsystem: "decoder")
+let job = Log.scoped(correlation: "job-\(id)", subsystem: "sync")
 job.info("started")
-job.debug("keyframe decoded", metadata: ["pts": 42])
-job.error("decode failed")
+job.debug("record processed", metadata: ["count": 42])
 ```
 
-Output:
-
 ```
-🟢 [INFO] [2025-01-15 10:30:45.123] [job-abc123] [decoder] (Pipeline.swift:42) process()
-    ┗━▶ started
+ INFO | 10:30:45.123 | SyncWorker.swift:42 | [job-abc123] [sync] started
+DEBUG | 10:30:45.200 | SyncWorker.swift:55 | [job-abc123] [sync] record processed {count=42}
 ```
 
-Scoped loggers are `Sendable` value types with no mutable state -- safe to pass across tasks. They provide convenience methods for each level: `.verbose()`, `.debug()`, `.info()`, `.warning()`, `.error()`, `.todo()`.
+Scoped loggers are `Sendable` value types with convenience methods for each level (`.verbose()`, `.debug()`, `.info()`, `.warning()`, `.error()`, `.todo()`).
 
-### Nesting
-
-A child scope inherits the parent's subsystem unless explicitly overridden:
+They nest -- a child inherits the parent's subsystem unless overridden:
 
 ```swift
 let pipeline = Log.scoped(correlation: "pipeline-1", subsystem: "pipeline")
@@ -128,136 +117,23 @@ let decode   = pipeline.scoped(correlation: "decode-1")              // keeps "p
 let io       = pipeline.scoped(correlation: "io-1", subsystem: "io") // overrides to "io"
 ```
 
-## Structured Metadata
+## Metadata
 
-Attach key-value pairs to any log call. They render as sorted `{key=value}` after the message:
-
-```swift
-Log("frame decoded", metadata: ["pts": 42, "size": 1024, "keyframe": true])
-```
-
-Output:
-
-```
-🟢 [INFO] [2025-01-15 10:30:45.123] (Decoder.swift:88) decode()
-    ┗━▶ frame decoded {keyframe=true, pts=42, size=1024}
-```
-
-Values use the `LogValue` enum which conforms to Swift literal protocols, so `42`, `3.14`, `true`, and `"text"` all work naturally at the call site. Metadata is `Sendable` and type-safe.
-
-## Per-File Controls
-
-### Level Overrides
-
-Set a specific log level for an individual source file:
+Type-safe key-value pairs via `LogValue`. Supports string, integer, float, and boolean literals directly.
 
 ```swift
-Log.logLevel(.verbose, forFile: "NetworkLayer.swift")
-   .logLevel(.error, forFile: "NoisyModule.swift")
+Log("request done", metadata: ["status": 200, "cached": false, "ms": 142.5, "path": "/home"])
 ```
 
-Reset to fall back to the global minimum:
-
-```swift
-Log.resetLogLevel(forFile: "NoisyModule.swift")
+```
+ INFO | 10:30:45.300 | APIClient.swift:88 | request done {cached=false, ms=142.5, path=/home, status=200}
 ```
 
-### Highlighting
-
-Prefix all output from a file with a magnifying glass for visual scanning:
-
-```swift
-Log.highlight("AuthManager.swift")
-// Output: 🔍 🔵 [DEBUG] [timestamp] (AuthManager.swift:12) ...
-
-Log.removeHighlight("AuthManager.swift")
-```
-
-## Exception Handling
-
-The logger can optionally install a process-wide uncaught exception handler:
-
-```swift
-Log.installExceptionHandler()
-```
-
-This captures the exception name, reason, and stack trace, logs it at `.error` level, flushes to the log file, and then forwards to any previously installed handler.
-
-This is **opt-in** and **idempotent**. For signal-based crash reporting (SIGSEGV, SIGABRT, etc.), use a dedicated crash reporter such as Firebase Crashlytics or Sentry.
-
-## Output Format
-
-```
-🔵 [DEBUG] [2025-01-15 10:30:45.123] [correlation] [subsystem] (File.swift:42) function()
-    ┗━▶ message {key=value, key=value}
-```
-
-Components:
-- **Emoji + level** -- color-coded severity
-- **Timestamp** -- millisecond precision, `yyyy-MM-dd HH:mm:ss.SSS`
-- **Correlation ID** -- present when using scoped loggers (omitted otherwise)
-- **Subsystem** -- present when specified (omitted otherwise)
-- **Source location** -- file name, line number, function name
-- **Message** -- the log message
-- **Metadata** -- sorted key-value pairs (omitted when empty)
-
-Highlighted files add a magnifying glass prefix before the emoji.
-
-## API Reference
-
-### Logging
-
-| API | Description |
-|---|---|
-| `Log("message")` | Log via `callAsFunction` (default level: `.info`) |
-| `Log.log("msg", level:subsystem:metadata:correlation:)` | Full-parameter log call |
-| `logVerbose("msg")` | Global function at `.verbose` level |
-| `logDebug("msg")` | Global function at `.debug` level |
-| `logInfo("msg")` | Global function at `.info` level |
-| `logWarning("msg")` | Global function at `.warning` level |
-| `logError("msg")` | Global function at `.error` level |
-| `logTODO("msg")` | Global function at `.todo` level |
-
-All message parameters are `@autoclosure` -- the string is not allocated when the level is filtered out.
-
-All global functions accept optional `subsystem:` and `metadata:` parameters.
-
-### Configuration
-
-| API | Description |
-|---|---|
-| `Log.minimumLevel(_:)` | Set global minimum level |
-| `Log.consoleLogging(_:)` | Toggle console output |
-| `Log.fileLogging(_:)` | Toggle file logging |
-| `Log.subsystem(_:level:)` | Set subsystem level |
-| `Log.resetSubsystem(_:)` | Remove subsystem level |
-| `Log.logLevel(_:forFile:)` | Set per-file level |
-| `Log.resetLogLevel(forFile:)` | Remove per-file level |
-| `Log.highlight(_:)` | Add highlight prefix for a file |
-| `Log.removeHighlight(_:)` | Remove highlight |
-| `Log.installExceptionHandler()` | Install crash handler |
-
-All configuration methods return `Logger` for chaining.
-
-### Scoped Loggers
-
-| API | Description |
-|---|---|
-| `Log.scoped(correlation:subsystem:)` | Create a scoped logger |
-| `scope.log(_:level:metadata:)` | Log with scope context |
-| `scope.verbose/debug/info/warning/error/todo(_:)` | Level-specific convenience |
-| `scope.scoped(correlation:subsystem:)` | Create a child scope |
-
-### State Queries
-
-| API | Description |
-|---|---|
-| `Log.isFileLoggingActive` | `true` if file logging is enabled with a valid file handle |
-| `Log.isExceptionHandlerInstalled` | `true` if the exception handler has been installed |
+Metadata keys are sorted alphabetically in the output.
 
 ## Thread Safety
 
-All logger state is protected by an internal lock. `Logger` is `@unchecked Sendable` with all mutable fields accessed exclusively under that lock. `ScopedLogger` is a `Sendable` value type with no mutable state. `DateFormatter` instances are thread-local to avoid contention. File writes are serialized on a dedicated dispatch queue.
+All logger state is lock-protected. Each log destination manages its own synchronization. `ScopedLogger` is a `Sendable` value type with no mutable state. File writes are serialized on a dedicated dispatch queue. `DateFormatter` instances are thread-local to avoid contention.
 
 ## License
 

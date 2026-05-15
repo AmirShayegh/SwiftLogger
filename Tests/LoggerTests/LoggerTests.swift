@@ -18,9 +18,9 @@ struct AllLoggerTests {
             #expect(LogLevel.error < LogLevel.todo)
         }
 
-        @Test func logLevelPrefixContainsRawValue() {
+        @Test func logLevelTagIsFixedWidth() {
             for level in LogLevel.allCases {
-                #expect(level.prefix.contains(level.rawValue))
+                #expect(level.tag.count == 5)
             }
         }
 
@@ -353,6 +353,7 @@ struct AllLoggerTests {
         @Test func messageEvaluatedWhenNotFiltered() {
             var evaluated = false
             Logger.shared.minimumLevel(.debug).consoleLogging(false)
+            Logger.shared.setOutputSink { _ in }
 
             Logger.shared.log({
                 evaluated = true
@@ -360,6 +361,56 @@ struct AllLoggerTests {
             }(), level: .error)
 
             #expect(evaluated)
+        }
+
+        @Test func callAsFunctionSkipsEvaluationWhenFiltered() {
+            var evaluated = false
+            Logger.shared.minimumLevel(.error).consoleLogging(false)
+
+            Log({
+                evaluated = true
+                return "expensive"
+            }(), level: .debug)
+
+            #expect(!evaluated)
+        }
+
+        @Test func globalFunctionSkipsEvaluationWhenFiltered() {
+            var evaluated = false
+            Logger.shared.minimumLevel(.error).consoleLogging(false)
+
+            logDebug({
+                evaluated = true
+                return "expensive"
+            }())
+
+            #expect(!evaluated)
+        }
+
+        @Test func scopedLoggerSkipsEvaluationWhenFiltered() {
+            var evaluated = false
+            Logger.shared.minimumLevel(.error).consoleLogging(false)
+
+            let scoped = Logger.shared.scoped(correlation: "test")
+            scoped.debug({
+                evaluated = true
+                return "expensive"
+            }())
+
+            #expect(!evaluated)
+        }
+
+        @Test func scopedInfoSkipsEvaluationWhenFiltered() {
+            var evaluated = false
+            Logger.shared.minimumLevel(.error).consoleLogging(false)
+
+            let scoped = Logger.shared.scoped(correlation: "test")
+            scoped.info({
+                evaluated = true
+                return "expensive"
+            }())
+
+            #expect(!evaluated)
         }
     }
 
