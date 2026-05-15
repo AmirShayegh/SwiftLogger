@@ -55,8 +55,13 @@ public final class FileDestination: @unchecked Sendable {
     }
 
     internal convenience init?() {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        self.init(url: docs.appendingPathComponent("app.log"))
+        let logsDir: URL
+        if let lib = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first {
+            logsDir = lib.appendingPathComponent("Logs")
+        } else {
+            logsDir = FileManager.default.temporaryDirectory
+        }
+        self.init(url: logsDir.appendingPathComponent("app.log"))
     }
 
     deinit {

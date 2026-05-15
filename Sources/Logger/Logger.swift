@@ -97,7 +97,7 @@ public final class Logger: @unchecked Sendable {
         return self
     }
 
-    /// Toggles file logging to `Documents/app.log`.
+    /// Toggles file logging to `Library/Logs/app.log`.
     ///
     /// The file handle is created lazily on first enable. If the file cannot be
     /// opened, file logging remains disabled and a warning is printed to console.

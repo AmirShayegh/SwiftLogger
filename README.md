@@ -50,11 +50,11 @@ Log.minimumLevel(.info)
 |---|---|---|
 | `minimumLevel(_:)` | `.debug` | Messages below this level are discarded |
 | `consoleLogging(_:)` | `true` | Toggle `print()` output |
-| `fileLogging(_:)` | `false` | Toggle file output to `Documents/app.log`. Check `isFileLoggingActive` to verify. |
+| `fileLogging(_:)` | `false` | Toggle file output to `Library/Logs/app.log`. Check `isFileLoggingActive` to verify. |
 | `fileLogging(url:label:minimumLevel:rotation:)` | -- | File logging to a custom URL with optional rotation |
 | `logLevel(_:forFile:)` | -- | Override level for a specific source file |
 | `highlight(_:)` | -- | Prefix output from a file with `>>>` |
-| `installExceptionHandler()` | off | Log uncaught `NSException`s. Chains to previous handler. Idempotent. |
+| `installExceptionHandler()` | off | Log uncaught `NSException`s. **Not a crash reporter** — use Crashlytics or Sentry for signal-based crashes (SIGSEGV, SIGABRT, etc.). |
 
 ## Levels
 
@@ -154,7 +154,7 @@ Log("disk-worthy warning", level: .warning) // both
 
 ## File Logging
 
-Basic file logging to `Documents/app.log`:
+Basic file logging to `Library/Logs/app.log`:
 
 ```swift
 Log.fileLogging(true)
