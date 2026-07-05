@@ -56,9 +56,36 @@ struct AllLoggerTests {
                 .consoleLogging(false)
             Logger.shared.setOutputSink { messages.append($0) }
 
-            // Simulating a call from "Noisy.swift" isn't possible with #file,
-            // but we can verify the API doesn't crash and reset works
+            // The override raises Noisy.swift to .error: a .debug from it is
+            // filtered and a .error from it passes, while an unrelated file falls
+            // back to the global .debug minimum.
+            Logger.shared.log("noisy debug", level: .debug, file: "Noisy.swift")
+            Logger.shared.log("noisy error", level: .error, file: "Noisy.swift")
+            Logger.shared.log("other debug", level: .debug, file: "Other.swift")
+
+            #expect(messages.count == 2)
+            #expect(messages.contains { $0.contains("noisy error") })
+            #expect(messages.contains { $0.contains("other debug") })
+            #expect(!messages.contains { $0.contains("noisy debug") })
+
+            // Resolution precedence: a subsystem level outranks the per-file
+            // override, so a .debug from Noisy.swift tagged subsystem "net"
+            // (level .verbose) passes despite the file being pinned to .error.
+            messages.removeAll()
+            Logger.shared.subsystem("net", level: .verbose)
+            Logger.shared.log("noisy net debug", level: .debug, subsystem: "net", file: "Noisy.swift")
+
+            #expect(messages.count == 1)
+            #expect(messages[0].contains("noisy net debug"))
+
+            // Clearing the override lets Noisy.swift fall back to the global
+            // .debug minimum, so a .debug from it passes again.
+            messages.removeAll()
             Logger.shared.resetLogLevel(forFile: "Noisy.swift")
+            Logger.shared.log("noisy debug again", level: .debug, file: "Noisy.swift")
+
+            #expect(messages.count == 1)
+            #expect(messages[0].contains("noisy debug again"))
         }
 
         @Test func fileLoggingReportsActiveState() {

@@ -16,15 +16,34 @@ import Foundation
 /// After bootstrapping, any code using `swift-log`'s `Logger` will have its
 /// messages routed through our Logger's destinations with full subsystem
 /// filtering support — the swift-log `label` becomes our `subsystem`.
+///
+/// ## Filtering
+///
+/// By default `logLevel` is `.trace`, so the handler performs no swift-log-side
+/// pre-filtering: every message reaches this library's pipeline and is filtered
+/// solely by *its* configuration (global minimum, per-subsystem levels from
+/// ``Logger/subsystem(_:level:)``, and per-file overrides). Passing a higher
+/// `level` to ``init(label:logger:level:)`` restores swift-log-side
+/// pre-filtering, dropping messages below that level before they ever reach the
+/// pipeline — a performance escape hatch for very hot code paths, at the cost of
+/// bypassing this library's own subsystem/file filtering for those messages.
+///
+/// ## Error bridging
+///
+/// If a message carries an attached `error:`, it is folded into the bridged
+/// metadata under the key `"error"` as `String(describing:)` — but only when the
+/// caller's own metadata does not already supply an `"error"` key, in which case
+/// the explicit caller value wins.
 public struct SwiftLogHandler: LogHandler {
-    public var logLevel: Logging.Logger.Level = .info
+    public var logLevel: Logging.Logger.Level = .trace
     public var metadata: Logging.Logger.Metadata = [:]
     private let label: String
     private let logger: Logger
 
-    public init(label: String, logger: Logger = .shared) {
+    public init(label: String, logger: Logger = .shared, level: Logging.Logger.Level = .trace) {
         self.label = label
         self.logger = logger
+        self.logLevel = level
     }
 
     public subscript(metadataKey key: String) -> Logging.Logger.Metadata.Value? {
@@ -38,6 +57,11 @@ public struct SwiftLogHandler: LogHandler {
         var merged = self.metadata
         if let extra = event.metadata {
             merged.merge(extra, uniquingKeysWith: { _, new in new })
+        }
+        // Fold any attached error into the bridged metadata. Explicit caller
+        // metadata wins, so only add it when no "error" key is already present.
+        if let error = event.error, merged["error"] == nil {
+            merged["error"] = .string(String(describing: error))
         }
         let ourMetadata: LogMetadata? = merged.isEmpty ? nil : merged.reduce(into: LogMetadata()) { result, pair in
             result[pair.key] = Self.mapMetadataValue(pair.value)

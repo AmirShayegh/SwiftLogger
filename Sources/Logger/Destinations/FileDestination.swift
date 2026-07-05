@@ -65,9 +65,17 @@ public final class FileDestination: @unchecked Sendable {
     }
 
     deinit {
-        queue.sync {
-            try? fileHandle.synchronize()
-            try? fileHandle.close()
+        // A pending write block may be the last owner of `self`, in which case
+        // GCD runs this deinit on the serial queue's own worker thread. Calling
+        // queue.sync here would trap (sync-onto-owned-queue) or deadlock, so we
+        // capture the handle and enqueue the flush/close asynchronously instead.
+        // Safe because the queue is serial+FIFO: any write blocks enqueued before
+        // deinit retained `self` and have already drained, and this block captures
+        // only the handle — never `self`.
+        let handle = fileHandle
+        queue.async {
+            try? handle.synchronize()
+            try? handle.close()
         }
     }
 
@@ -119,8 +127,20 @@ public final class FileDestination: @unchecked Sendable {
     }
 
     private func reopenOrFail() {
+        // Recreate the log file if it vanished (e.g. deleted externally, or a
+        // rotation moveItem consumed it but the fresh createFile failed). Without
+        // this, FileHandle(forWritingTo:) never creates a missing file and every
+        // subsequent write is silently dropped for the process lifetime.
+        if !FileManager.default.fileExists(atPath: fileURL.path) {
+            let dir = fileURL.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
+        }
+
         if let handle = try? FileHandle(forWritingTo: fileURL) {
             self.fileHandle = handle
+            // Reset the tracked size to the reopened file so rotateIfNeeded stops
+            // re-entering on every write.
             self.currentFileSize = handle.seekToEndOfFile()
         } else {
             fputs("[Logger] File rotation failed — could not reopen \(fileURL.path)\n", stderr)
@@ -129,7 +149,8 @@ public final class FileDestination: @unchecked Sendable {
 
     private func pruneArchives(in dir: URL, baseName: String, max: Int) {
         let fm = FileManager.default
-        guard let contents = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey]
+        guard let contents = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: Array(keys)) else { return }
 
         let prefix = baseName + "."
         let archives = contents
@@ -140,7 +161,19 @@ public final class FileDestination: @unchecked Sendable {
                 // Match: YYYYMMDDTHHMMSSZuuid8 pattern (e.g. 20250515T121530Z_a1b2c3d4)
                 return suffix.range(of: #"^\d{8}T\d{6}Z_[a-f0-9]{8}$"#, options: .regularExpression) != nil
             }
-            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+            // Order newest-first. The name's timestamp has only 1-second resolution, so
+            // a burst of rotations within the same second all share a timestamp and the
+            // trailing UUID is random — sorting by name alone would keep arbitrary (often
+            // older) archives and delete newer ones. Sort by the file's modification date
+            // (nanosecond resolution), which is preserved by moveItem and increases
+            // monotonically with rotation order; fall back to the name only to break exact
+            // date ties deterministically.
+            .sorted { a, b in
+                let da = (try? a.resourceValues(forKeys: keys).contentModificationDate) ?? .distantPast
+                let db = (try? b.resourceValues(forKeys: keys).contentModificationDate) ?? .distantPast
+                if da != db { return da > db }
+                return a.lastPathComponent > b.lastPathComponent
+            }
 
         if archives.count > max {
             for old in archives[max...] {

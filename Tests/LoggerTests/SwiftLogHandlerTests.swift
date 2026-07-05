@@ -116,5 +116,66 @@ extension AllLoggerTests {
             handler[metadataKey: "request-id"] = nil
             #expect(handler[metadataKey: "request-id"] == nil)
         }
+
+        // A distinct error type so its `String(describing:)` is easy to assert on.
+        private struct SampleError: Error, CustomStringConvertible {
+            var description: String { "sample-error-detail" }
+        }
+
+        @Test func errorParameterIsBridgedToMetadata() {
+            Logger.shared.consoleLogging(false)
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+            Logger.shared.setOutputSink { _ in }
+
+            // Drive the real swift-log frontend; `Logger(label:factory:)` avoids
+            // the once-per-process `LoggingSystem.bootstrap`.
+            let error = SampleError()
+            let swiftLog = Logging.Logger(label: "test.err") { SwiftLogHandler(label: $0) }
+            swiftLog.error("boom", error: error)
+
+            #expect(mock.entries.count == 1)
+            #expect(mock.entries[0].metadata?["error"]?.description == String(describing: error))
+        }
+
+        @Test func explicitErrorMetadataKeyWins() {
+            Logger.shared.consoleLogging(false)
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+            Logger.shared.setOutputSink { _ in }
+
+            let swiftLog = Logging.Logger(label: "test.err") { SwiftLogHandler(label: $0) }
+            swiftLog.error("boom", error: SampleError(), metadata: ["error": "explicit"])
+
+            #expect(mock.entries.count == 1)
+            #expect(mock.entries[0].metadata?["error"]?.description == "explicit")
+        }
+
+        @Test func debugMessagesReachPipelineByDefault() {
+            Logger.shared.consoleLogging(false)
+            // Allow the whole range through this library's pipeline so the only
+            // possible gate is the handler's swift-log-side `logLevel`.
+            Logger.shared.minimumLevel(.verbose)
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+            Logger.shared.setOutputSink { _ in }
+
+            // Default handler: no swift-log-side pre-filtering, so both .debug and
+            // .trace reach the mock destination.
+            let swiftLog = Logging.Logger(label: "test.pipeline") { SwiftLogHandler(label: $0) }
+            swiftLog.debug("debug msg")
+            swiftLog.trace("trace msg")
+
+            #expect(mock.entries.count == 2)
+            #expect(mock.entries.contains { $0.message == "debug msg" })
+            #expect(mock.entries.contains { $0.message == "trace msg" })
+
+            // Escape hatch: a handler built with a higher level pre-filters on the
+            // swift-log side, so .info never reaches the pipeline.
+            let filtered = Logging.Logger(label: "test.filtered") { SwiftLogHandler(label: $0, level: .warning) }
+            filtered.info("info msg")
+
+            #expect(!mock.entries.contains { $0.message == "info msg" })
+        }
     }
 }

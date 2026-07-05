@@ -14,6 +14,12 @@ final class MockDestination: LogDestination, @unchecked Sendable {
         return _entries
     }
 
+    private var _flushCount = 0
+    var flushCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _flushCount
+    }
+
     init(label: String = "mock", minimumLevel: LogLevel? = nil) {
         self.label = label
         self.minimumLevel = minimumLevel
@@ -22,6 +28,12 @@ final class MockDestination: LogDestination, @unchecked Sendable {
     func write(_ entry: LogEntry) {
         lock.lock()
         _entries.append(entry)
+        lock.unlock()
+    }
+
+    func flush() {
+        lock.lock()
+        _flushCount += 1
         lock.unlock()
     }
 }
@@ -125,6 +137,50 @@ extension AllLoggerTests {
             #expect(result === Logger.shared)
         }
 
+        // Locked probe (bug category: silent no-op at a boundary). File destinations
+        // write asynchronously, and a singleton-owned destination cannot be reached
+        // by the caller to drain it — so at process exit the tail of the log was
+        // silently lost. Logger.flush() must forward to every destination.
+        @Test func loggerFlushForwardsToAllDestinations() {
+            let a = MockDestination(label: "flush-a")
+            let b = MockDestination(label: "flush-b")
+            Logger.shared.addDestination(a).addDestination(b)
+
+            Logger.shared.flush()
+
+            #expect(a.flushCount >= 1)
+            #expect(b.flushCount >= 1)
+        }
+
+        // Locked probe (bug category: silent no-op at a boundary). A real end-to-end
+        // durability assertion: 500 entries logged through the full pipeline into an
+        // async file destination, then flush() with NO sleep. flush() must act as a
+        // barrier that drains the write queue, so every entry is on disk immediately.
+        // Pre-fix there was no Logger.flush(), and the singleton-owned destination
+        // could not be drained at all.
+        @Test func loggerFlushPersistsQueuedFileWrites() throws {
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("logger-flush-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let logURL = dir.appendingPathComponent("flush.log")
+
+            let fd = FileDestination(url: logURL)!
+            Logger.shared.consoleLogging(false)
+            Logger.shared.addDestination(fd)
+
+            let count = 500
+            for i in 0..<count {
+                Logger.shared.log("FLUSH_\(i)_END", level: .info)
+            }
+            Logger.shared.flush()
+
+            let content = try String(contentsOf: logURL, encoding: .utf8)
+            for i in 0..<count {
+                #expect(content.contains("FLUSH_\(i)_END"))
+            }
+        }
+
         @Test func logEntryPublicInit() {
             let entry = LogEntry(level: .warning, message: "test")
             #expect(entry.level == .warning)
@@ -178,6 +234,84 @@ extension AllLoggerTests {
             let console = ConsoleDestination(minimumLevel: .warning)
             #expect(console.label == "console")
             #expect(console.minimumLevel == .warning)
+        }
+
+        // MARK: - Default vs. Custom File Destination Scoping
+
+        /// Reads `url` repeatedly until it contains `marker` or `timeout` elapses.
+        /// Logger-owned file destinations write asynchronously and cannot be reached
+        /// for a direct `flush()`, so polling stands in for one.
+        private func waitForContent(
+            of url: URL,
+            containing marker: String,
+            timeout: TimeInterval = 2.0
+        ) -> String {
+            let deadline = Date().addingTimeInterval(timeout)
+            var content = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            while !content.contains(marker) && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.02)
+                content = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            }
+            return content
+        }
+
+        @Test func fileLoggingFalsePreservesCustomFileDestinations() throws {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("logger-test-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            let customURL = tmp.appendingPathComponent("custom.log")
+
+            Logger.shared.consoleLogging(false)
+            Logger.shared.fileLogging(url: customURL, label: "custom")
+
+            // Disabling the default file destination is scoped to the "file" label,
+            // so a differently-labelled custom destination must survive.
+            Logger.shared.fileLogging(false)
+            #expect(Logger.shared.isFileLoggingActive)
+
+            Logger.shared.log("survives default disable", level: .info)
+
+            let content = waitForContent(of: customURL, containing: "survives default disable")
+            #expect(content.contains("survives default disable"))
+        }
+
+        @Test func fileLoggingTrueCreatesDefaultAlongsideCustom() throws {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("logger-test-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            let customURL = tmp.appendingPathComponent("custom.log")
+
+            // fileLogging(true) writes the default destination to the real
+            // ~/Library/Logs/app.log. Track whether it pre-existed so we can remove
+            // any empty file we create and keep the test hermetic.
+            let defaultURL = FileManager.default
+                .urls(for: .libraryDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("Logs/app.log")
+            let defaultExistedBefore = defaultURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? true
+            defer {
+                if let defaultURL, !defaultExistedBefore {
+                    try? FileManager.default.removeItem(at: defaultURL)
+                }
+            }
+
+            Logger.shared.consoleLogging(false)
+            Logger.shared.fileLogging(url: customURL, label: "custom")
+
+            // With only a "custom"-labelled file destination present, enabling the
+            // default must add a "file" destination alongside it rather than silently
+            // no-opping (the old type-based guard would have skipped creation).
+            Logger.shared.fileLogging(true)
+
+            // Disabling again removes only the "file" destination; the custom one is
+            // left intact and still active. Under the old type-based behaviour this
+            // removeAll would have destroyed the custom destination too.
+            Logger.shared.fileLogging(false)
+            #expect(Logger.shared.isFileLoggingActive)
+
+            Logger.shared.log("custom survives round trip", level: .info)
+
+            let content = waitForContent(of: customURL, containing: "custom survives round trip")
+            #expect(content.contains("custom survives round trip"))
         }
     }
 }

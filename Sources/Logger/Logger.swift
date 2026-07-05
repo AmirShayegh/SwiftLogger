@@ -47,6 +47,11 @@ public final class Logger: @unchecked Sendable {
 
     // MARK: - Destination Access (internal)
 
+    /// Label identifying the default file destination managed by ``fileLogging(_:)``.
+    /// Matches the default label of ``fileLogging(url:label:minimumLevel:rotation:)``
+    /// and the internal `FileDestination` convenience initializer.
+    private static let defaultFileLabel = "file"
+
     private func destination<T: LogDestination>(ofType type: T.Type) -> T? {
         _destinations.first(where: { $0 is T }) as? T
     }
@@ -97,16 +102,25 @@ public final class Logger: @unchecked Sendable {
         return self
     }
 
-    /// Toggles file logging to `Library/Logs/app.log`.
+    /// Toggles the default file destination, which logs to `Library/Logs/app.log`
+    /// under the label `"file"`.
     ///
-    /// The file handle is created lazily on first enable. If the file cannot be
-    /// opened, file logging remains disabled and a warning is printed to console.
-    /// Check ``isFileLoggingActive`` to verify.
+    /// This method operates strictly on that default destination, identified by its
+    /// `"file"` label. Custom file destinations registered via
+    /// ``fileLogging(url:label:minimumLevel:rotation:)`` with a different label are
+    /// left untouched — enabling adds the default alongside them, and disabling
+    /// removes only the default. To remove a custom destination, use
+    /// ``removeDestination(label:)``.
+    ///
+    /// The file handle is created lazily on first enable, and only when no `"file"`
+    /// destination already exists. If the file cannot be opened, file logging
+    /// remains disabled and a warning is printed to console. Check
+    /// ``isFileLoggingActive`` to verify.
     @discardableResult
     public func fileLogging(_ enabled: Bool) -> Logger {
         lock.lock()
         if enabled {
-            if fileDestination == nil {
+            if !_destinations.contains(where: { $0.label == Self.defaultFileLabel }) {
                 if let fd = FileDestination() {
                     _destinations.append(fd)
                 } else {
@@ -116,7 +130,7 @@ public final class Logger: @unchecked Sendable {
                 }
             }
         } else {
-            _destinations.removeAll(where: { $0 is FileDestination })
+            _destinations.removeAll(where: { $0.label == Self.defaultFileLabel })
         }
         lock.unlock()
         return self
@@ -257,6 +271,23 @@ public final class Logger: @unchecked Sendable {
         _destinations.removeAll(where: { $0.label == label })
         lock.unlock()
         return self
+    }
+
+    /// Blocks until every destination has drained its buffered output to storage.
+    ///
+    /// File destinations write asynchronously on a background queue, so at normal
+    /// process exit the tail of the log can be lost if the queue has not caught up
+    /// (most likely under bursty logging or when rotation is slowing the sink).
+    /// Call this before terminating — e.g. in `applicationWillTerminate` or an
+    /// `atexit` handler — to guarantee queued entries reach disk. It is safe to call
+    /// at any time and on any thread.
+    public func flush() {
+        lock.lock()
+        let destinations = _destinations
+        lock.unlock()
+        for destination in destinations {
+            destination.flush()
+        }
     }
 
     // MARK: - OSLog Convenience

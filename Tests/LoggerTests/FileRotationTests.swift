@@ -195,5 +195,104 @@ extension AllLoggerTests {
                 #expect(allContent.contains("SEQ_\(i)_END"))
             }
         }
+
+        @Test func deinitWithPendingWritesDoesNotCrash() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let logURL = dir.appendingPathComponent("deinit.log")
+
+            // Repeatedly create a destination, enqueue a write, then drop the only
+            // strong reference while the write may still be in flight. When the
+            // pending block is the last owner, deinit runs on the queue's own worker
+            // thread — pre-fix this SIGTRAPs in queue.sync; post-fix reaching the end
+            // of the loop is the assertion.
+            for i in 0..<50 {
+                var fd: FileDestination? = FileDestination(url: logURL)
+                fd?.write(LogEntry(level: .info, message: "pending write \(i)"))
+                fd = nil
+            }
+
+            // The async deinit cleanup must complete and leave the file usable.
+            let fd = FileDestination(url: logURL)
+            #expect(fd != nil)
+            fd?.flush()
+
+            let handle = try FileHandle(forWritingTo: logURL)
+            try? handle.close()
+        }
+
+        @Test func reopenAfterExternalDeletionRecreatesFile() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let logURL = dir.appendingPathComponent("test.log")
+
+            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 64, maxArchivedFilesCount: 10))!
+
+            fd.write(LogEntry(level: .info, message: "before deletion"))
+            fd.flush()
+
+            // Simulate the live log file being deleted out from under us. The open
+            // handle still points at the now-unlinked inode, so writes keep growing
+            // currentFileSize until a rotation fires — at which point moveItem throws
+            // (source gone) and recovery must recreate the file.
+            try FileManager.default.removeItem(at: logURL)
+
+            for i in 0..<30 {
+                fd.write(LogEntry(level: .info, message: "POSTDEL_\(i)_END padding to cross threshold"))
+            }
+            fd.flush()
+
+            // The log file must have been recreated at its original path...
+            #expect(FileManager.default.fileExists(atPath: logURL.path))
+
+            // ...and the post-deletion entries must be recoverable from the current
+            // file plus any archives created by subsequent rotations.
+            var allContent = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+            for archive in archives(in: dir, baseName: "test.log") {
+                allContent += (try? String(contentsOf: archive, encoding: .utf8)) ?? ""
+            }
+            #expect(allContent.contains("POSTDEL_"))
+        }
+
+        // Locked probe (bug category: destructive edge case). A fast burst rotates
+        // many times within the same wall-clock second, so every archive shares the
+        // 1-second-resolution timestamp in its name. Retention must still keep the
+        // NEWEST archives. Pre-fix, pruning sorted by filename and fell through to
+        // the random UUID suffix on the tied timestamps, keeping arbitrary (often
+        // older) archives and silently deleting newer logs — a probe of this saw an
+        // archive from entry ~46 survive while archives around entry ~150–330 were
+        // deleted. Post-fix, sorting by modification date keeps a contiguous newest
+        // suffix.
+        @Test func pruningKeepsNewestArchivesUnderSameSecondBurst() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let logURL = dir.appendingPathComponent("burst.log")
+
+            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 60, maxArchivedFilesCount: 3))!
+
+            let count = 200
+            for i in 0..<count {
+                fd.write(LogEntry(level: .info, message: "SEQ_\(String(format: "%05d", i))_END"))
+            }
+            fd.flush()
+
+            var surviving = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+            for archive in archives(in: dir, baseName: "burst.log") {
+                surviving += (try? String(contentsOf: archive, encoding: .utf8)) ?? ""
+            }
+
+            // The most recent entry is always retained (it lives in the current file).
+            #expect(surviving.contains("SEQ_\(String(format: "%05d", count - 1))_END"))
+
+            // With retention 3 and a tiny threshold, only the last handful of entries
+            // can survive. No entry from the first half of the run may remain — pre-fix,
+            // random-UUID tiebreaking let early archives slip through and this fails.
+            for i in 0..<(count / 2) {
+                #expect(
+                    !surviving.contains("SEQ_\(String(format: "%05d", i))_END"),
+                    "early entry SEQ_\(i) should have been pruned but survived"
+                )
+            }
+        }
     }
 }
