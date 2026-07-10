@@ -54,24 +54,30 @@ public struct SwiftLogHandler: LogHandler {
     public func log(event: LogEvent) {
         let ourLevel = Self.mapLevel(event.level)
 
-        var merged = self.metadata
-        if let extra = event.metadata {
-            merged.merge(extra, uniquingKeysWith: { _, new in new })
-        }
-        // Fold any attached error into the bridged metadata. Explicit caller
-        // metadata wins, so only add it when no "error" key is already present.
-        if let error = event.error, merged["error"] == nil {
-            merged["error"] = .string(String(describing: error))
-        }
-        let ourMetadata: LogMetadata? = merged.isEmpty ? nil : merged.reduce(into: LogMetadata()) { result, pair in
-            result[pair.key] = Self.mapMetadataValue(pair.value)
-        }
-
+        // Build the bridged metadata lazily so the merge/fold/map cost is paid
+        // only after `logMessage` clears BOTH the level and active-destination
+        // gates. swift-log has already applied its own `logLevel` gate before
+        // calling us, but that is independent of this library's per-subsystem/
+        // per-file/global thresholds, so an eager build here would still be
+        // wasted whenever our pipeline suppresses the message.
         logger.logMessage(
             { event.message.description },
             level: ourLevel,
             subsystem: label,
-            metadata: ourMetadata,
+            metadata: {
+                var merged = self.metadata
+                if let extra = event.metadata {
+                    merged.merge(extra, uniquingKeysWith: { _, new in new })
+                }
+                // Fold any attached error into the bridged metadata. Explicit caller
+                // metadata wins, so only add it when no "error" key is already present.
+                if let error = event.error, merged["error"] == nil {
+                    merged["error"] = .string(String(describing: error))
+                }
+                return merged.isEmpty ? nil : merged.reduce(into: LogMetadata()) { result, pair in
+                    result[pair.key] = Self.mapMetadataValue(pair.value)
+                }
+            },
             correlation: nil,
             file: event.file,
             function: event.function,
