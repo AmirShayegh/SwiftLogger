@@ -211,6 +211,94 @@ struct AllLoggerTests {
 
             #expect(messages.isEmpty)
         }
+
+        // MARK: - Resolution memoisation
+
+        @Test func subsystemLevelMutationInvalidatesMemoizedResolution() {
+            var messages: [String] = []
+            Logger.shared.minimumLevel(.error).subsystem("net", level: .debug)
+            Logger.shared.setOutputSink { messages.append($0) }
+
+            // Resolve once so the answer is memoised...
+            Logger.shared.log("first", level: .debug, subsystem: "net.http")
+            #expect(messages.count == 1)
+
+            // ...then change the level. The memo lives on the configuration
+            // snapshot, which is replaced wholesale by any mutation, so a stale
+            // answer is structurally impossible rather than merely unlikely.
+            Logger.shared.subsystem("net", level: .error)
+            Logger.shared.log("second", level: .debug, subsystem: "net.http")
+            #expect(messages.count == 1)
+
+            // And back again.
+            Logger.shared.subsystem("net", level: .debug)
+            Logger.shared.log("third", level: .debug, subsystem: "net.http")
+            #expect(messages.count == 2)
+            #expect(messages[1].contains("third"))
+        }
+
+        @Test func resolvedToNilIsMemoizedDistinctlyFromUnresolved() {
+            var messages: [String] = []
+            Logger.shared.minimumLevel(.warning).subsystem("configured", level: .debug)
+            Logger.shared.setOutputSink { messages.append($0) }
+
+            // "unconfigured" walks the whole hierarchy and finds nothing. That
+            // nil is itself worth caching, so the second call must behave
+            // identically to the first — a memo that stored nil as "not yet
+            // computed" would still be correct here, but one that mistook a
+            // cached nil for a *level* would wrongly let this through.
+            for _ in 0..<3 {
+                Logger.shared.log("filtered", level: .debug, subsystem: "unconfigured.deep.name")
+            }
+            #expect(messages.isEmpty)
+
+            // The global minimum still applies to the unresolved subsystem.
+            Logger.shared.log("passes", level: .warning, subsystem: "unconfigured.deep.name")
+            #expect(messages.count == 1)
+
+            // A configured sibling is unaffected by the cached nil.
+            Logger.shared.log("configured passes", level: .debug, subsystem: "configured.child")
+            #expect(messages.count == 2)
+        }
+
+        @Test func concurrentSubsystemResolutionIsSafe() {
+            Logger.shared.minimumLevel(.error)
+            for i in 0..<20 {
+                Logger.shared.subsystem("zone\(i)", level: .debug)
+            }
+            let sink = MockDestination(label: "concurrent-resolve")
+            Logger.shared.addDestination(sink)
+
+            // Hammers the memo from many threads at once: reads, first-time
+            // inserts, and repeat hits all interleaved. The thread sanitiser
+            // lane is what actually polices this.
+            DispatchQueue.concurrentPerform(iterations: 200) { i in
+                Logger.shared.log("m", level: .debug, subsystem: "zone\(i % 20).child.leaf")
+                Logger.shared.log("m", level: .debug, subsystem: "unconfigured\(i % 20)")
+            }
+
+            // Only the configured zones pass the gate; each of the 200
+            // iterations logs exactly one qualifying message.
+            #expect(sink.entries.count == 200)
+        }
+
+        @Test func memoizationHasNoUpperBoundOnDistinctNames() {
+            Logger.shared.minimumLevel(.error).subsystem("capped", level: .debug)
+            let sink = MockDestination(label: "capped-sink")
+            Logger.shared.addDestination(sink)
+
+            // Far more distinct names than the memo can hold, to prove the
+            // insert cap degrades to "resolve every time" rather than to a
+            // wrong answer.
+            for i in 0..<3_000 {
+                Logger.shared.log("m", level: .debug, subsystem: "capped.request-\(i)")
+            }
+            #expect(sink.entries.count == 3_000)
+
+            // Still correct after the cap is reached.
+            Logger.shared.log("m", level: .debug, subsystem: "uncapped.other")
+            #expect(sink.entries.count == 3_000)
+        }
     }
 
     // MARK: - Scoped Loggers

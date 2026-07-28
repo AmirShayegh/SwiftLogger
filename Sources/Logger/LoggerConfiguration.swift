@@ -6,7 +6,10 @@ import Foundation
 /// field on every message, ``Logger`` keeps one of these and swaps in a wholly
 /// new instance when configuration changes. Readers take a single reference
 /// load and then work against a value that cannot change underneath them.
-internal final class LoggerConfiguration: Sendable {
+/// `@unchecked Sendable` rather than `Sendable`: every stored property is a
+/// `let` except ``subsystemLevelMemo``, which is mutable but touched only under
+/// ``memoLock``.
+internal final class LoggerConfiguration: @unchecked Sendable {
     let minimumLogLevel: LogLevel
     let fileLogLevels: [String: LogLevel]
     let subsystemLevels: [String: LogLevel]
@@ -15,6 +18,23 @@ internal final class LoggerConfiguration: Sendable {
     /// `true` when no per-file override exists, letting the hot path skip
     /// deriving a file name from `#fileID` entirely.
     let hasFileLevelOverrides: Bool
+
+    /// Memoised results of ``resolveSubsystemLevel(_:)``.
+    ///
+    /// The outer optional is dictionary lookup ("have we resolved this name?");
+    /// the inner one is the answer, where `nil` means "walked the hierarchy and
+    /// found nothing" — a result worth caching, since an unconfigured subsystem
+    /// pays the full walk every time otherwise.
+    ///
+    /// It can never go stale: configuration changes build a whole new
+    /// `LoggerConfiguration`, discarding this along with it.
+    private var subsystemLevelMemo: [String: LogLevel?] = [:]
+    private let memoLock = UnfairLock()
+
+    /// Ceiling on memo entries. Subsystem names come from call sites, so the
+    /// set is normally tiny and fixed; the cap is a backstop against a caller
+    /// that interpolates unbounded values (a request ID, say) into one.
+    private static let memoCapacity = 1_024
 
     init(
         minimumLogLevel: LogLevel,
@@ -58,10 +78,34 @@ internal final class LoggerConfiguration: Sendable {
 
     /// Resolves a subsystem's level, walking up the dot-separated hierarchy
     /// (`"a.b.c"` -> `"a.b"` -> `"a"`) until a configured level is found.
+    ///
+    /// The walk allocates a substring per level and hashes it, so a deep name
+    /// costs several dictionary lookups on every single message. Results are
+    /// memoised per configuration snapshot; the same handful of subsystem
+    /// strings recur for the life of a process.
     func resolveSubsystemLevel(_ name: String) -> LogLevel? {
-        // Fast path: with no subsystem levels configured there is nothing to walk.
+        // Fast path: with no subsystem levels configured there is nothing to
+        // walk, and nothing worth taking a lock for.
         if subsystemLevels.isEmpty { return nil }
 
+        if let memoised = memoLock.withLock({ subsystemLevelMemo[name] }) {
+            return memoised
+        }
+
+        let resolved = walkSubsystemHierarchy(name)
+
+        memoLock.withLock {
+            // Stop inserting at the cap rather than evicting: an eviction
+            // policy would need its own bookkeeping on the hot path, and past
+            // this point the memo is already holding every name that recurs.
+            if subsystemLevelMemo.count < Self.memoCapacity {
+                subsystemLevelMemo[name] = resolved
+            }
+        }
+        return resolved
+    }
+
+    private func walkSubsystemHierarchy(_ name: String) -> LogLevel? {
         var current = name
         while true {
             if let level = subsystemLevels[current] {
