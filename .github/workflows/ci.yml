@@ -5,23 +5,63 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Weekly canary: runner-image and tzdata drift fails on its own run,
+    # not on someone's PR. Monday 06:17 UTC (non-zero minute per GH guidance).
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Build & Test (macOS)
-    runs-on: macos-14
+  swift:
+    name: ${{ matrix.name }}
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Build & Test (debug)
+            command: swift test -v
+          - name: Thread Sanitizer
+            command: swift test --sanitize=thread
+          - name: Release build
+            # Build-only for now: `swift test -c release` lands once the
+            # debug-only format-cache counters are compiled out under #if DEBUG.
+            command: swift build -c release -v
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show Swift version
-        run: swift --version
+      - name: Select Xcode
+        run: |
+          XCODE_APP="$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -vi beta | sort -V | tail -n 1)"
+          if [ -z "$XCODE_APP" ]; then
+            echo "::error::No versioned Xcode found on runner image"
+            exit 1
+          fi
+          echo "Selecting $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          swift --version
 
-      - name: Build
-        run: swift build -v
+      - name: ${{ matrix.name }}
+        run: ${{ matrix.command }}
 
-      - name: Test
-        run: swift test -v
+  ios-build:
+    name: Build (iOS Simulator)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          XCODE_APP="$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -vi beta | sort -V | tail -n 1)"
+          [ -n "$XCODE_APP" ] || { echo "::error::No versioned Xcode found"; exit 1; }
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+
+      - name: List schemes (diagnostic)
+        run: xcodebuild -list
+
+      - name: Build for iOS Simulator
+        run: xcodebuild build -scheme Logger -destination 'generic/platform=iOS Simulator'
