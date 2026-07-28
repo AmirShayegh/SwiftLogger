@@ -79,7 +79,9 @@ public final class FileDestination: @unchecked Sendable {
     }
 
     public func forceSave(_ message: String) {
-        guard let data = (message + "\n").data(using: .utf8) else { return }
+        // Swift strings are always representable as UTF-8, so this cannot fail —
+        // unlike `data(using:)`, which forces an optional for no reason here.
+        let data = Data((message + "\n").utf8)
         let work = { [self] in
             try? self.fileHandle.write(contentsOf: data)
             try? self.fileHandle.synchronize()
@@ -198,7 +200,7 @@ extension FileDestination: LogDestination {
 
     public func write(_ entry: LogEntry) {
         let line = entry.format()
-        guard let data = (line + "\n").data(using: .utf8) else { return }
+        let data = Data((line + "\n").utf8)
         queue.async { [self] in
             try? self.fileHandle.write(contentsOf: data)
             self.currentFileSize += UInt64(data.count)

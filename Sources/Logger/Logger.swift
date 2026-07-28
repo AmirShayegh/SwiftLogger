@@ -444,7 +444,10 @@ public final class Logger: @unchecked Sendable {
             subsystem: subsystem,
             fileName: fileName ?? Self.lastPathComponent(of: file),
             function: function,
-            line: line
+            line: line,
+            // Only worth an allocation when more than one destination would
+            // otherwise format the same entry independently.
+            formatCache: writable.count > 1 ? LogEntryFormatCache() : nil
         )
 
         for destination in writable {

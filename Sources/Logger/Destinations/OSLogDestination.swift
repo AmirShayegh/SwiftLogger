@@ -66,8 +66,7 @@ public final class OSLogDestination: LogDestination, @unchecked Sendable {
         parts.append(entry.message)
 
         if let meta = entry.metadata, !meta.isEmpty {
-            let pairs = meta.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", ")
-            parts.append("{\(pairs)}")
+            parts.append("{\(LogEntry.formatMetadata(meta))}")
         }
 
         return parts.joined(separator: " ")

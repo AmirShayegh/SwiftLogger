@@ -38,7 +38,120 @@ final class MockDestination: LogDestination, @unchecked Sendable {
     }
 }
 
+/// A destination that formats every entry, mirroring what the built-in console
+/// and file destinations do.
+final class FormattingDestination: LogDestination, @unchecked Sendable {
+    let label: String
+    var isEnabled: Bool { true }
+    var minimumLevel: LogLevel? { nil }
+
+    private let lock = NSLock()
+    private var _lines: [String] = []
+    private var _entries: [LogEntry] = []
+
+    var lines: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return _lines
+    }
+
+    var entries: [LogEntry] {
+        lock.lock(); defer { lock.unlock() }
+        return _entries
+    }
+
+    init(label: String) { self.label = label }
+
+    func write(_ entry: LogEntry) {
+        let line = entry.format()
+        lock.lock()
+        _lines.append(line)
+        _entries.append(entry)
+        lock.unlock()
+    }
+}
+
 extension AllLoggerTests {
+
+    /// The default-format line is computed once per entry and shared when an
+    /// entry fans out to several destinations.
+    struct FormatCacheTests {
+
+        init() {
+            Logger.shared.reset()
+            LogEntryFormatCache.resetComputeCountForTesting()
+        }
+
+        @Test func fanOutToMultipleDestinationsFormatsOnce() {
+            Logger.shared.consoleLogging(false)
+
+            // Three destinations that each call entry.format(), as the built-in
+            // console and file destinations do.
+            let a = FormattingDestination(label: "fmt-a")
+            let b = FormattingDestination(label: "fmt-b")
+            let c = FormattingDestination(label: "fmt-c")
+            Logger.shared.addDestination(a).addDestination(b).addDestination(c)
+
+            LogEntryFormatCache.resetComputeCountForTesting()
+            Logger.shared.log("shared line", level: .error)
+
+            #expect(LogEntryFormatCache.computeCount == 1)
+            #expect(a.lines == b.lines)
+            #expect(b.lines == c.lines)
+            #expect(a.lines.first?.contains("shared line") == true)
+        }
+
+        @Test func singleDestinationSkipsTheCacheAllocation() {
+            Logger.shared.consoleLogging(false)
+            let only = FormattingDestination(label: "fmt-only")
+            Logger.shared.addDestination(only)
+
+            LogEntryFormatCache.resetComputeCountForTesting()
+            Logger.shared.log("solo line", level: .error)
+
+            // One destination, one computation — and no cache box was allocated.
+            #expect(LogEntryFormatCache.computeCount == 1)
+            #expect(only.lines.count == 1)
+        }
+
+        @Test func repeatedFormatCallsOnCopiesComputeOnce() {
+            Logger.shared.consoleLogging(false)
+            let a = FormattingDestination(label: "fmt-a")
+            let b = FormattingDestination(label: "fmt-b")
+            Logger.shared.addDestination(a).addDestination(b)
+
+            LogEntryFormatCache.resetComputeCountForTesting()
+            Logger.shared.log("copy me", level: .error)
+
+            // Re-format the entry a destination kept, plus a struct copy of it:
+            // the cache reference is shared across copies, so still one compute.
+            let kept = a.entries[0]
+            let copy = kept
+            _ = kept.format()
+            _ = copy.format()
+
+            #expect(LogEntryFormatCache.computeCount == 1)
+        }
+
+        @Test func directlyConstructedEntriesStillFormat() {
+            // A LogEntry built through the public initialiser has no cache box.
+            // It must still format correctly, just without sharing.
+            LogEntryFormatCache.resetComputeCountForTesting()
+            let entry = LogEntry(level: .warning, message: "manual", fileName: "Manual.swift", line: 7)
+
+            #expect(entry.format() == entry.format())
+            #expect(entry.format().contains("manual"))
+            #expect(LogEntryFormatCache.computeCount == 3)
+        }
+
+        @Test func metadataIsOrderedByKey() {
+            let entry = LogEntry(
+                level: .info,
+                message: "m",
+                metadata: ["zebra": 1, "alpha": 2, "middle": 3]
+            )
+            #expect(entry.format().contains("{alpha=2, middle=3, zebra=1}"))
+        }
+    }
 
     struct DestinationTests {
 
