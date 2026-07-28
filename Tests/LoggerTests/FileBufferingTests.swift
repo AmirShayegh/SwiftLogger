@@ -263,7 +263,7 @@ extension AllLoggerTests {
             // maxFileSize before rotation could look at it.
             let fd = FileDestination(
                 url: url,
-                rotationConfig: FileRotationConfig(maxFileSize: 128, maxArchivedFilesCount: 2)
+                rotation: FileRotationConfig(maxFileSize: 128, maxArchivedFilesCount: 2)
             )!
             #expect(fd.flushByteThreshold == 128)
 

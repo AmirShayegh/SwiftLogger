@@ -173,7 +173,7 @@ public final class Logger: @unchecked Sendable {
                 url: url,
                 label: label,
                 minimumLevel: minimumLevel,
-                rotationConfig: rotation,
+                rotation: rotation,
                 formatter: formatter
             ) else {
                 openFailed = true

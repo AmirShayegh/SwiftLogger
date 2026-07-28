@@ -44,7 +44,7 @@ extension AllLoggerTests {
             // Huge size limit so only age can trigger rotation.
             let fd = FileDestination(
                 url: url,
-                rotationConfig: FileRotationConfig(
+                rotation: FileRotationConfig(
                     maxFileSize: 10_000_000,
                     maxArchivedFilesCount: 5,
                     maxFileAge: 0.05
@@ -79,7 +79,7 @@ extension AllLoggerTests {
 
             let fd = FileDestination(
                 url: url,
-                rotationConfig: FileRotationConfig(
+                rotation: FileRotationConfig(
                     maxFileSize: 10_000_000,
                     maxArchivedFilesCount: 5,
                     maxFileAge: 0.05
@@ -102,7 +102,7 @@ extension AllLoggerTests {
 
             let fd = FileDestination(
                 url: url,
-                rotationConfig: FileRotationConfig(
+                rotation: FileRotationConfig(
                     maxFileSize: 80,
                     maxArchivedFilesCount: 5,
                     maxFileAge: 3600  // far away; size must be what fires
@@ -124,7 +124,7 @@ extension AllLoggerTests {
 
             let fd = FileDestination(
                 url: url,
-                rotationConfig: FileRotationConfig(maxFileSize: 10_000_000, maxArchivedFilesCount: 5)
+                rotation: FileRotationConfig(maxFileSize: 10_000_000, maxArchivedFilesCount: 5)
             )!
             fd.write(LogEntry(level: .info, message: "entry"))
             fd.flush()
@@ -199,7 +199,7 @@ extension AllLoggerTests {
 
             let fd = FileDestination(
                 url: url,
-                rotationConfig: FileRotationConfig(
+                rotation: FileRotationConfig(
                     maxFileSize: 200,
                     maxArchivedFilesCount: 5,
                     compressArchives: true
@@ -231,7 +231,7 @@ extension AllLoggerTests {
             let keep = 2
             let fd = FileDestination(
                 url: url,
-                rotationConfig: FileRotationConfig(
+                rotation: FileRotationConfig(
                     maxFileSize: 100,
                     maxArchivedFilesCount: keep,
                     compressArchives: true
@@ -255,7 +255,7 @@ extension AllLoggerTests {
 
             let fd = FileDestination(
                 url: url,
-                rotationConfig: FileRotationConfig(maxFileSize: 100, maxArchivedFilesCount: 5)
+                rotation: FileRotationConfig(maxFileSize: 100, maxArchivedFilesCount: 5)
             )!
             for i in 0..<20 {
                 fd.write(LogEntry(level: .info, message: "plain entry \(i) with padding to roll over"))
@@ -268,5 +268,28 @@ extension AllLoggerTests {
         }
 
         #endif
+
+        // MARK: - Deprecated spelling
+
+        @Test func deprecatedRotationConfigLabelStillConstructsAndRotates() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("legacy.log")
+
+            // The old rotationConfig: label is deprecated, not removed — existing
+            // adopters must keep compiling and rotating. The deprecation warning
+            // this line emits is the point of the test.
+            let fd = FileDestination(
+                url: url,
+                rotationConfig: FileRotationConfig(maxFileSize: 80, maxArchivedFilesCount: 5)
+            )!
+
+            for i in 0..<10 {
+                fd.write(LogEntry(level: .info, message: "legacy entry \(i) with padding"))
+                fd.flush()
+            }
+
+            #expect(!archives(in: dir, baseName: "legacy.log").isEmpty)
+        }
     }
 }

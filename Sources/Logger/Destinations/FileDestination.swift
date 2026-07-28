@@ -87,13 +87,13 @@ public final class FileDestination: @unchecked Sendable {
         url: URL,
         label: String = "file",
         minimumLevel: LogLevel? = nil,
-        rotationConfig: FileRotationConfig? = nil,
+        rotation: FileRotationConfig? = nil,
         formatter: any LogFormatter = DefaultLogFormatter()
     ) {
         self.label = label
         self.fileURL = url
         self._minimumLevel = minimumLevel
-        self.rotationConfig = rotationConfig
+        self.rotationConfig = rotation
         self.formatter = formatter
 
         if !FileManager.default.fileExists(atPath: url.path) {
@@ -114,12 +114,33 @@ public final class FileDestination: @unchecked Sendable {
         self.queue = DispatchQueue(label: "com.logger.filewriter.\(label)")
         self.queue.setSpecific(key: Self.queueKey, value: true)
 
-        if let maxFileSize = rotationConfig?.maxFileSize {
+        if let maxFileSize = rotation?.maxFileSize {
             self.flushByteThreshold = max(
                 1,
                 Int(min(maxFileSize, UInt64(Self.defaultFlushByteThreshold)))
             )
         }
+    }
+
+    /// Deprecated spelling of ``init(url:label:minimumLevel:rotation:formatter:)``.
+    ///
+    /// `rotationConfig:` deliberately has no default value — giving it one would
+    /// make `FileDestination(url:)` ambiguous between the two initializers.
+    @available(*, deprecated, renamed: "init(url:label:minimumLevel:rotation:formatter:)")
+    public convenience init?(
+        url: URL,
+        label: String = "file",
+        minimumLevel: LogLevel? = nil,
+        rotationConfig: FileRotationConfig?,
+        formatter: any LogFormatter = DefaultLogFormatter()
+    ) {
+        self.init(
+            url: url,
+            label: label,
+            minimumLevel: minimumLevel,
+            rotation: rotationConfig,
+            formatter: formatter
+        )
     }
 
     internal convenience init?() {

@@ -31,7 +31,7 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("test.log")
 
-            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 100, maxArchivedFilesCount: 5))!
+            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 100, maxArchivedFilesCount: 5))!
 
             for i in 0..<20 {
                 fd.write(LogEntry(level: .info, message: "message \(i) with padding to exceed threshold"))
@@ -47,7 +47,7 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("app.log")
 
-            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 50, maxArchivedFilesCount: 5))!
+            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 50, maxArchivedFilesCount: 5))!
 
             for i in 0..<10 {
                 fd.write(LogEntry(level: .info, message: "msg \(i) padding to trigger rotation"))
@@ -69,7 +69,7 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("test.log")
 
-            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 50, maxArchivedFilesCount: 2))!
+            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 50, maxArchivedFilesCount: 2))!
 
             for i in 0..<50 {
                 fd.write(LogEntry(level: .info, message: "entry \(i) with enough padding to rotate multiple times"))
@@ -85,7 +85,7 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("test.log")
 
-            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 50, maxArchivedFilesCount: 0))!
+            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 50, maxArchivedFilesCount: 0))!
 
             for i in 0..<20 {
                 fd.write(LogEntry(level: .info, message: "entry \(i) with enough padding to trigger rotation"))
@@ -101,7 +101,7 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("test.log")
 
-            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 50, maxArchivedFilesCount: 5))!
+            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 50, maxArchivedFilesCount: 5))!
 
             for i in 0..<10 {
                 fd.write(LogEntry(level: .info, message: "old entry \(i) padding"))
@@ -141,7 +141,7 @@ extension AllLoggerTests {
             let bigData = Data(repeating: 65, count: 200)
             try bigData.write(to: logURL)
 
-            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 100, maxArchivedFilesCount: 5))!
+            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 100, maxArchivedFilesCount: 5))!
 
             fd.write(LogEntry(level: .info, message: "trigger"))
             fd.flush()
@@ -155,7 +155,7 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("test.log")
 
-            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 200, maxArchivedFilesCount: 10))!
+            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 200, maxArchivedFilesCount: 10))!
 
             await withTaskGroup(of: Void.self) { group in
                 for i in 0..<100 {
@@ -176,7 +176,7 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("test.log")
 
-            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 100, maxArchivedFilesCount: 50))!
+            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 100, maxArchivedFilesCount: 50))!
 
             let count = 30
             for i in 0..<count {
@@ -226,7 +226,7 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("test.log")
 
-            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 64, maxArchivedFilesCount: 10))!
+            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 64, maxArchivedFilesCount: 10))!
 
             fd.write(LogEntry(level: .info, message: "before deletion"))
             fd.flush()
@@ -268,7 +268,7 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("burst.log")
 
-            let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 60, maxArchivedFilesCount: 3))!
+            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 60, maxArchivedFilesCount: 3))!
 
             // Flush per entry so each one is its own batch and rotation fires as
             // often as possible, reproducing the same-second archive burst this
