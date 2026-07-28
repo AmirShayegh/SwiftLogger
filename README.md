@@ -94,6 +94,21 @@ let decode   = pipeline.scoped(correlation: "decode-1")              // keeps "p
 let io       = pipeline.scoped(correlation: "io-1", subsystem: "io") // overrides to "io"
 ```
 
+A scope can also carry default metadata, merged into every message it emits. Per-call metadata wins on key collisions, so a message reporting a specific state is never masked by the scope's default.
+
+```swift
+let session = Log.scoped(correlation: "s-1", metadata: ["user": userID, "state": "running"])
+session.info("started")                            // {state=running, user=…}
+session.error("failed", metadata: ["state": "failed"])  // {state=failed, user=…}
+```
+
+Child scopes merge into the parent's metadata rather than replacing it:
+
+```swift
+let child = session.scoped(correlation: "c-1", metadata: ["task": "sync"])
+child.info("working")  // {state=running, task=sync, user=…}
+```
+
 ## Metadata
 
 Type-safe key-value pairs via `LogValue`. Supports string, integer, float, and boolean literals directly.

@@ -304,6 +304,94 @@ struct AllLoggerTests {
             let child = parent.scoped(correlation: "child", subsystem: "decoder")
             #expect(child.subsystem == "decoder")
         }
+
+        // MARK: - Scope metadata
+
+        @Test func scopeMetadataAppearsInEveryMessage() {
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+
+            let session = Logger.shared.scoped(correlation: "s-1", metadata: ["user": "u42", "tier": "pro"])
+            session.info("first")
+            session.error("second")
+
+            #expect(mock.entries.count == 2)
+            for entry in mock.entries {
+                #expect(entry.metadata?["user"]?.description == "u42")
+                #expect(entry.metadata?["tier"]?.description == "pro")
+            }
+        }
+
+        @Test func perCallMetadataMergesWithScopeMetadata() {
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+
+            let session = Logger.shared.scoped(correlation: "s-1", metadata: ["user": "u42"])
+            session.info("done", metadata: ["ms": 17])
+
+            let meta = mock.entries[0].metadata
+            #expect(meta?["user"]?.description == "u42")
+            #expect(meta?["ms"]?.description == "17")
+        }
+
+        @Test func perCallMetadataWinsOnKeyCollision() {
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+
+            // A message reporting a specific state must not be overridden by the
+            // scope's default for that key.
+            let session = Logger.shared.scoped(correlation: "s-1", metadata: ["state": "running"])
+            session.error("it failed", metadata: ["state": "failed"])
+
+            #expect(mock.entries[0].metadata?["state"]?.description == "failed")
+        }
+
+        @Test func scopeMetadataAppliesToTheGenericLogMethodToo() {
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+
+            let session = Logger.shared.scoped(correlation: "s-1", metadata: ["user": "u42"])
+            session.log("via log()", level: .warning, metadata: ["extra": true])
+
+            let meta = mock.entries[0].metadata
+            #expect(meta?["user"]?.description == "u42")
+            #expect(meta?["extra"]?.description == "true")
+        }
+
+        @Test func childScopeInheritsAndExtendsParentMetadata() {
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+
+            let parent = Logger.shared.scoped(correlation: "p", metadata: ["app": "demo", "user": "u1"])
+            let child = parent.scoped(correlation: "c", metadata: ["task": "sync", "user": "u2"])
+
+            // Inherited keys survive, new keys are added, and the child's own
+            // value wins where they collide.
+            #expect(child.metadata?["app"]?.description == "demo")
+            #expect(child.metadata?["task"]?.description == "sync")
+            #expect(child.metadata?["user"]?.description == "u2")
+
+            child.info("child message")
+            #expect(mock.entries[0].metadata?["app"]?.description == "demo")
+
+            // The parent is a value type and is left untouched.
+            #expect(parent.metadata?["user"]?.description == "u1")
+            #expect(parent.metadata?["task"] == nil)
+        }
+
+        @Test func scopeWithoutMetadataPassesCallSiteMetadataThroughUnchanged() {
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+
+            let plain = Logger.shared.scoped(correlation: "s-1")
+            #expect(plain.metadata == nil)
+
+            plain.info("only call-site", metadata: ["k": 1])
+            #expect(mock.entries[0].metadata?["k"]?.description == "1")
+
+            plain.info("none at all")
+            #expect(mock.entries[1].metadata == nil)
+        }
     }
 
     // MARK: - Metadata

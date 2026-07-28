@@ -352,8 +352,16 @@ public final class Logger: @unchecked Sendable {
     ///     let job = Log.scoped(correlation: "job-\(id)", subsystem: "decoder")
     ///     job.info("started")
     ///     job.debug("frame decoded", metadata: ["pts": 42])
-    public func scoped(correlation: String, subsystem: String? = nil) -> ScopedLogger {
-        ScopedLogger(logger: self, correlation: correlation, subsystem: subsystem)
+    ///
+    /// Pass `metadata` to attach context to every message from the scope:
+    ///
+    ///     let session = Log.scoped(correlation: "s-1", metadata: ["user": userID])
+    public func scoped(
+        correlation: String,
+        subsystem: String? = nil,
+        metadata: LogMetadata? = nil
+    ) -> ScopedLogger {
+        ScopedLogger(logger: self, correlation: correlation, subsystem: subsystem, metadata: metadata)
     }
 
     // MARK: - callAsFunction
