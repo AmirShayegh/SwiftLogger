@@ -264,7 +264,7 @@ public final class FileDestination: @unchecked Sendable {
     public func forceSave(_ message: String) {
         // Swift strings are always representable as UTF-8, so this cannot fail —
         // unlike `data(using:)`, which forces an optional for no reason here.
-        let data = Data((message + "\n").utf8)
+        let data = Self.lineData(message)
         let work = { [self] in
             // Drain anything buffered first so the crash log lands after the
             // entries that led up to it rather than jumping ahead of them.
@@ -302,7 +302,27 @@ public final class FileDestination: @unchecked Sendable {
         )
         // Rendered with this destination's formatter so the notice is parseable
         // by whatever reads the rest of the file.
-        return Data((formatter.format(entry) + "\n").utf8)
+        return Self.lineData(formatter.format(entry))
+    }
+
+    /// Encodes `line` and its trailing newline into one buffer.
+    ///
+    /// `Data((line + "\n").utf8)` copies the whole line into an intermediate
+    /// String just to put one byte after it, then copies again into the Data.
+    /// This reserves once and memcpys the UTF-8 directly.
+    private static func lineData(_ line: String) -> Data {
+        let utf8 = line.utf8
+        var data = Data(capacity: utf8.count + 1)
+        let copied: Void? = utf8.withContiguousStorageIfAvailable { buffer in
+            data.append(contentsOf: buffer)
+        }
+        if copied == nil {
+            // Rare: a String whose UTF-8 is not contiguous (some bridged
+            // NSStrings). Correctness over speed.
+            data.append(contentsOf: utf8)
+        }
+        data.append(0x0A)
+        return data
     }
 
     /// Appends `data` to the buffer and makes sure a flush is on its way.
@@ -621,7 +641,7 @@ extension FileDestination: LogDestination {
     /// Buffers the entry. Formatting happens on the calling thread; the write
     /// itself is coalesced with neighbouring entries onto the serial queue.
     public func write(_ entry: LogEntry) {
-        enqueue(Data((formatter.format(entry) + "\n").utf8))
+        enqueue(Self.lineData(formatter.format(entry)))
     }
 
     /// Drains the buffer and forces it to storage before returning.

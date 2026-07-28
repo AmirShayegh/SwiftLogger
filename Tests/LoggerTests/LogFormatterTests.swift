@@ -228,5 +228,28 @@ extension AllLoggerTests {
 
             #expect(try String(contentsOf: url, encoding: .utf8) == "<INFO>terse\n")
         }
+
+        @Test func multiByteMessagesSurviveLineEncodingIntact() throws {
+            struct PassthroughFormatter: LogFormatter {
+                func format(_ entry: LogEntry) -> String { entry.message }
+            }
+
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("unicode.log")
+
+            // The line encoder memcpys UTF-8 out of the String's contiguous
+            // storage rather than going through an intermediate String, so
+            // multi-byte scalars and combining marks are worth pinning: a
+            // count/byte mismatch would truncate exactly here.
+            let messages = ["héllo wörld", "🌍🌏 emoji", "日本語のログ", "e\u{0301}gal"]
+            let fd = FileDestination(url: url, formatter: PassthroughFormatter())!
+            for message in messages {
+                fd.write(LogEntry(level: .info, message: message))
+            }
+            fd.flush()
+
+            #expect(try String(contentsOf: url, encoding: .utf8) == messages.joined(separator: "\n") + "\n")
+        }
     }
 }
