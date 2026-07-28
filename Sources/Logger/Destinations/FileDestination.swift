@@ -3,7 +3,8 @@ import Foundation
 /// Configuration for automatic log file rotation.
 public struct FileRotationConfig: Sendable {
     /// Maximum file size in bytes before rotation triggers. Default: 10 MB.
-    /// This is a soft threshold — the file may exceed this by one entry.
+    /// This is a soft threshold: writes are batched, so the file may exceed it
+    /// by up to one batch.
     public var maxFileSize: UInt64
     /// Maximum number of archived log files to keep. 0 means no archives retained. Default: 5.
     public var maxArchivedFilesCount: Int
@@ -19,10 +20,42 @@ public final class FileDestination: @unchecked Sendable {
     public let label: String
     private let queue: DispatchQueue
     private let fileURL: URL
-    private var fileHandle: FileHandle
-    private var currentFileSize: UInt64
     private let rotationConfig: FileRotationConfig?
     private let _minimumLevel: LogLevel?
+
+    // MARK: - Serial-queue-only state
+    //
+    // `fileHandle`, `currentFileSize`, and everything rotation touches are read
+    // and written exclusively on `queue`, so they need no lock.
+
+    private var fileHandle: FileHandle
+    private var currentFileSize: UInt64
+
+    // MARK: - Buffer state (guarded by `stateLock`)
+
+    private let stateLock = UnfairLock()
+    private var pending = Data()
+    private var pendingCount = 0
+    private var droppedCount = 0
+    private var scheduledFlush: DispatchWorkItem?
+    /// Whether `scheduledFlush` was dispatched to run immediately rather than
+    /// after `flushInterval`.
+    private var scheduledFlushIsImmediate = false
+
+    /// Entries buffered before new ones are dropped. Bounds the memory a burst
+    /// of logging can consume when the disk cannot keep up.
+    internal var maxBufferedEntries = 1_000
+    /// How long a partial buffer waits before being written.
+    internal var flushInterval: TimeInterval = 0.1
+    /// Buffer size that triggers an immediate write rather than waiting out the
+    /// interval.
+    ///
+    /// Clamped to the rotation threshold in `init`: buffering more than a whole
+    /// log file's worth guarantees blowing past `maxFileSize` before rotation
+    /// gets a chance to look, so the overshoot stays bounded by one batch.
+    internal var flushByteThreshold = defaultFlushByteThreshold
+
+    internal static let defaultFlushByteThreshold = 4_096
 
     public init?(
         url: URL,
@@ -51,6 +84,13 @@ public final class FileDestination: @unchecked Sendable {
         self.currentFileSize = handle.seekToEndOfFile()
         self.queue = DispatchQueue(label: "com.logger.filewriter.\(label)")
         self.queue.setSpecific(key: Self.queueKey, value: true)
+
+        if let maxFileSize = rotationConfig?.maxFileSize {
+            self.flushByteThreshold = max(
+                1,
+                Int(min(maxFileSize, UInt64(Self.defaultFlushByteThreshold)))
+            )
+        }
     }
 
     internal convenience init?() {
@@ -64,15 +104,33 @@ public final class FileDestination: @unchecked Sendable {
     }
 
     deinit {
-        // A pending write block may be the last owner of `self`, in which case
+        // A pending flush block may be the last owner of `self`, in which case
         // GCD runs this deinit on the serial queue's own worker thread. Calling
         // queue.sync here would trap (sync-onto-owned-queue) or deadlock, so we
-        // capture the handle and enqueue the flush/close asynchronously instead.
-        // Safe because the queue is serial+FIFO: any write blocks enqueued before
-        // deinit retained `self` and have already drained, and this block captures
-        // only the handle — never `self`.
+        // capture what we need and enqueue the final write asynchronously instead.
+        // Safe because the queue is serial+FIFO: any flush enqueued before deinit
+        // held `self` strongly for its duration and has already drained, and this
+        // block captures only the handle and the leftover bytes — never `self`.
         let handle = fileHandle
+        let remaining = stateLock.withLock { () -> Data in
+            scheduledFlush?.cancel()
+            scheduledFlush = nil
+
+            scheduledFlushIsImmediate = false
+            var data = pending
+            if droppedCount > 0 {
+                data.append(Self.droppedNoticeData(count: droppedCount))
+                droppedCount = 0
+            }
+            pending = Data()
+            pendingCount = 0
+            return data
+        }
+
         queue.async {
+            if !remaining.isEmpty {
+                try? handle.write(contentsOf: remaining)
+            }
             try? handle.synchronize()
             try? handle.close()
         }
@@ -83,7 +141,11 @@ public final class FileDestination: @unchecked Sendable {
         // unlike `data(using:)`, which forces an optional for no reason here.
         let data = Data((message + "\n").utf8)
         let work = { [self] in
+            // Drain anything buffered first so the crash log lands after the
+            // entries that led up to it rather than jumping ahead of them.
+            self.performFlush()
             try? self.fileHandle.write(contentsOf: data)
+            self.currentFileSize += UInt64(data.count)
             try? self.fileHandle.synchronize()
         }
         if DispatchQueue.getSpecific(key: Self.queueKey) == true {
@@ -91,6 +153,92 @@ public final class FileDestination: @unchecked Sendable {
         } else {
             queue.sync(execute: work)
         }
+    }
+
+    // MARK: - Buffering
+
+    private static func droppedNoticeData(count: Int) -> Data {
+        let entry = LogEntry(
+            level: .warning,
+            message: "[Logger] dropped \(count) message\(count == 1 ? "" : "s") — write buffer full",
+            fileName: "FileDestination.swift"
+        )
+        return Data((entry.format() + "\n").utf8)
+    }
+
+    /// Appends `data` to the buffer and makes sure a flush is on its way.
+    ///
+    /// When the buffer is at capacity the entry is dropped and counted instead,
+    /// and the count is reported in the log the next time the buffer drains.
+    private func enqueue(_ data: Data) {
+        // The scheduling decision has to be made under the same lock that
+        // mutates the buffer, or a concurrent flush could empty `pending`
+        // between deciding and dispatching.
+        let scheduled: (work: DispatchWorkItem, immediately: Bool)? = stateLock.withLock {
+            guard pendingCount < maxBufferedEntries else {
+                // Drop the newest rather than blocking the caller. Logging must
+                // never stall the app because the disk is slow.
+                droppedCount += 1
+                return nil
+            }
+
+            pending.append(data)
+            pendingCount += 1
+
+            let shouldWriteNow = pending.count >= flushByteThreshold
+
+            if let existing = scheduledFlush {
+                // A flush is already on its way. Only upgrade a delayed one to
+                // immediate; re-dispatching an already-immediate flush on every
+                // write would let a tight logging loop cancel it repeatedly and
+                // starve the write entirely.
+                guard shouldWriteNow, !scheduledFlushIsImmediate else { return nil }
+                existing.cancel()
+            }
+
+            let item = DispatchWorkItem { [weak self] in
+                // Weak on purpose: a strong capture would keep the destination
+                // alive for the whole flush interval, delaying the deinit drain
+                // past removeDestination(label:) or reset().
+                self?.performFlush()
+            }
+            scheduledFlush = item
+            scheduledFlushIsImmediate = shouldWriteNow
+            return (item, shouldWriteNow)
+        }
+
+        guard let scheduled else { return }
+        if scheduled.immediately {
+            queue.async(execute: scheduled.work)
+        } else {
+            queue.asyncAfter(deadline: .now() + flushInterval, execute: scheduled.work)
+        }
+    }
+
+    /// Writes the buffered bytes. Runs only on the serial queue.
+    private func performFlush() {
+        let chunk = stateLock.withLock { () -> Data in
+            // Clearing `scheduledFlush` before the write means a `write()` racing
+            // with it schedules a fresh flush, which the serial queue runs after
+            // this one. Clearing it afterwards could lose that wakeup.
+            scheduledFlush = nil
+
+            scheduledFlushIsImmediate = false
+            var data = pending
+            if droppedCount > 0 {
+                data.append(Self.droppedNoticeData(count: droppedCount))
+                droppedCount = 0
+            }
+            pending = Data()
+            pendingCount = 0
+            return data
+        }
+
+        guard !chunk.isEmpty else { return }
+
+        try? fileHandle.write(contentsOf: chunk)
+        currentFileSize += UInt64(chunk.count)
+        rotateIfNeeded()
     }
 
     // MARK: - Rotation (runs exclusively on serial queue)
@@ -198,18 +346,23 @@ extension FileDestination: LogDestination {
 
     public var minimumLevel: LogLevel? { _minimumLevel }
 
+    /// Buffers the entry. Formatting happens on the calling thread; the write
+    /// itself is coalesced with neighbouring entries onto the serial queue.
     public func write(_ entry: LogEntry) {
-        let line = entry.format()
-        let data = Data((line + "\n").utf8)
-        queue.async { [self] in
-            try? self.fileHandle.write(contentsOf: data)
-            self.currentFileSize += UInt64(data.count)
-            self.rotateIfNeeded()
-        }
+        enqueue(Data((entry.format() + "\n").utf8))
     }
 
+    /// Drains the buffer and forces it to storage before returning.
     public func flush() {
+        // Cancel any scheduled flush: we are about to do its work synchronously,
+        // and leaving it queued would just wake up to an empty buffer.
+        stateLock.withLock {
+            scheduledFlush?.cancel()
+            scheduledFlush = nil
+        }
+
         let work = { [self] in
+            self.performFlush()
             try? self.fileHandle.synchronize()
         }
         // Same reasoning as `forceSave`: `queue.sync` from the queue's own thread

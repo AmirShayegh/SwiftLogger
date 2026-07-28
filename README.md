@@ -170,9 +170,21 @@ Log.fileLogging(
 )
 ```
 
-`maxFileSize` is a soft post-write threshold -- a file may exceed it by one entry. Archives are named with a UTC timestamp and short UUID (e.g. `myapp.log.20250515T121530Z_a1b2c3d4`) and pruned to `maxArchivedFilesCount`. Set `maxArchivedFilesCount` to `0` to retain no archives.
+`maxFileSize` is a soft post-write threshold -- a file may exceed it by up to one batch (see below). Archives are named with a UTC timestamp and short UUID (e.g. `myapp.log.20250515T121530Z_a1b2c3d4`) and pruned to `maxArchivedFilesCount`. Set `maxArchivedFilesCount` to `0` to retain no archives.
 
 The file handle is kept open for the lifetime of the destination -- no open/close overhead per write.
+
+### Buffering and backpressure
+
+Entries are buffered and written in batches -- one `write` syscall per batch instead of one per entry. A batch is written when it reaches 4 KB or after 100 ms, whichever comes first. With rotation configured the size trigger is clamped to `maxFileSize`, so the file cannot overshoot by more than a batch.
+
+The buffer holds at most 1000 entries. Past that, **new entries are dropped** rather than blocking the caller -- logging never stalls your app because the disk is slow. Dropped entries are counted, and the count is written to the log as a warning once the buffer drains:
+
+```
+ WARN | 12:15:30.842 | FileDestination.swift:0 | [Logger] dropped 42 messages — write buffer full
+```
+
+Call `Log.flush()` to drain the buffer synchronously; it is also drained when the destination is deallocated, so entries are not lost when you swap destinations out. At process exit, call `flush()` from `applicationWillTerminate` or an `atexit` handler.
 
 ## OSLog
 

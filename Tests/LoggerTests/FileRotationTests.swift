@@ -270,11 +270,16 @@ extension AllLoggerTests {
 
             let fd = FileDestination(url: logURL, rotationConfig: FileRotationConfig(maxFileSize: 60, maxArchivedFilesCount: 3))!
 
+            // Flush per entry so each one is its own batch and rotation fires as
+            // often as possible, reproducing the same-second archive burst this
+            // test is about. Without it, batching coalesces the writes into a
+            // handful of large batches and only a few rotations happen — which
+            // exercises the batching, not the pruning order under test.
             let count = 200
             for i in 0..<count {
                 fd.write(LogEntry(level: .info, message: "SEQ_\(String(format: "%05d", i))_END"))
+                fd.flush()
             }
-            fd.flush()
 
             var surviving = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
             for archive in archives(in: dir, baseName: "burst.log") {
