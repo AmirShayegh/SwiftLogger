@@ -215,21 +215,29 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("sustained.log")
 
-            let fd = FileDestination(url: url, tunables: .init(flushByteThreshold: 256))!
+            // The cap is raised above the entry count on purpose. This test is
+            // about flush starvation — a tight loop repeatedly re-scheduling
+            // the flush so it never runs — and the buffer cap is a *separate*,
+            // deliberate drop mechanism with its own tests. Leaving the default
+            // 1000 cap here made the assertion race the drain: whether all 5000
+            // survived depended on how fast the queue kept up, so the test
+            // failed intermittently for a reason that was not the bug it guards.
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(maxBufferedEntries: 10_000, flushByteThreshold: 256)
+            )!
 
-            // A tight loop must not be able to starve the flush by continually
-            // re-scheduling it.
             for i in 0..<5_000 {
                 fd.write(LogEntry(level: .info, message: "sustained \(i)"))
             }
             fd.flush()
 
             let written = lines(of: url)
-            // Buffer cap is 1000 with no drops expected here, since the byte
-            // threshold keeps draining it. Every line should be present.
             #expect(written.count == 5_000)
             #expect(written.first?.contains("sustained 0") == true)
             #expect(written.last?.contains("sustained 4999") == true)
+            // Starvation would show up as a drop notice, not just a short file.
+            #expect(!contents(of: url).contains("write buffer full"))
         }
 
         @Test func concurrentWritersLoseNothing() async throws {
@@ -237,10 +245,19 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("concurrent.log")
 
-            let fd = FileDestination(url: url, tunables: .init(flushByteThreshold: 512))!
-
             let writers = 8
             let perWriter = 250
+
+            // Cap raised above writers * perWriter so overflow cannot occur:
+            // this test is about the buffer's *concurrency* correctness, not
+            // its overflow policy (which burstBeyondCapacityDropsNewestAndReportsTheCount
+            // covers). With the default 1000 cap, eight threads could outrun the
+            // drain and legitimately drop, which made a passing run depend on
+            // machine load rather than on the code being correct.
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(maxBufferedEntries: writers * perWriter * 2, flushByteThreshold: 512)
+            )!
 
             await withTaskGroup(of: Void.self) { group in
                 for w in 0..<writers {
@@ -253,7 +270,17 @@ extension AllLoggerTests {
             }
             fd.flush()
 
-            #expect(lines(of: url).count == writers * perWriter)
+            let written = lines(of: url)
+            #expect(written.count == writers * perWriter)
+            #expect(!contents(of: url).contains("write buffer full"))
+
+            // Every single entry, not just the right count — a lost entry
+            // paired with a duplicate would otherwise pass.
+            let found = Set(written.compactMap { line -> String? in
+                guard let range = line.range(of: #"w\d+-i\d+"#, options: .regularExpression) else { return nil }
+                return String(line[range])
+            })
+            #expect(found.count == writers * perWriter)
         }
 
         @Test func appendModeAllowsTwoHandlesOnOneFileWithoutOverwrite() throws {

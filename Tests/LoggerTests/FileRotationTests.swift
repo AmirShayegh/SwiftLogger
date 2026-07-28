@@ -226,21 +226,32 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("test.log")
 
-            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 64, maxArchivedFilesCount: 10))!
+            // healthCheckStride: 1 makes recovery depend on the number of
+            // flushes rather than on how many entries GCD happened to coalesce
+            // into each batch. Without it, whether this passed came down to
+            // scheduling: if all the post-deletion entries landed in a single
+            // batch, that one write went to the orphaned inode and nothing was
+            // left to find.
+            let fd = FileDestination(
+                url: logURL,
+                rotation: FileRotationConfig(maxFileSize: 64, maxArchivedFilesCount: 10),
+                tunables: .init(reopenBackoff: 0, healthCheckStride: 1)
+            )!
 
             fd.write(LogEntry(level: .info, message: "before deletion"))
             fd.flush()
 
             // Simulate the live log file being deleted out from under us. The open
-            // handle still points at the now-unlinked inode, so writes keep growing
-            // currentFileSize until a rotation fires — at which point moveItem throws
-            // (source gone) and recovery must recreate the file.
+            // handle still points at the now-unlinked inode, so writes keep going
+            // nowhere until the handle is noticed to be unlinked and replaced.
             try FileManager.default.removeItem(at: logURL)
 
+            // Flush per entry so each one is its own batch: the first is lost to
+            // the orphaned inode, and every later one must reach a real file.
             for i in 0..<30 {
                 fd.write(LogEntry(level: .info, message: "POSTDEL_\(i)_END padding to cross threshold"))
+                fd.flush()
             }
-            fd.flush()
 
             // The log file must have been recreated at its original path...
             #expect(FileManager.default.fileExists(atPath: logURL.path))
