@@ -465,7 +465,7 @@ public final class Logger: @unchecked Sendable {
         _ message: @autoclosure () -> String,
         level: LogLevel = .info,
         subsystem: String? = nil,
-        metadata: LogMetadata? = nil,
+        metadata: @autoclosure () -> LogMetadata? = nil,
         correlation: String? = nil,
         file: String = #fileID,
         function: String = #function,
@@ -478,13 +478,14 @@ public final class Logger: @unchecked Sendable {
 
     /// Emits a log message if `level` meets the effective threshold.
     ///
-    /// The message is an `@autoclosure` — the string is not allocated when the
-    /// level is filtered out, which matters in hot paths like decode loops.
+    /// Both `message` and `metadata` are `@autoclosure`s — neither the string
+    /// nor the metadata dictionary is built when the level is filtered out,
+    /// which matters in hot paths like decode loops.
     public func log(
         _ message: @autoclosure () -> String,
         level: LogLevel = .info,
         subsystem: String? = nil,
-        metadata: LogMetadata? = nil,
+        metadata: @autoclosure () -> LogMetadata? = nil,
         correlation: String? = nil,
         file: String = #fileID,
         function: String = #function,
@@ -501,7 +502,7 @@ public final class Logger: @unchecked Sendable {
         _ message: () -> String,
         level: LogLevel = .info,
         subsystem: String? = nil,
-        metadata: LogMetadata? = nil,
+        metadata: () -> LogMetadata? = { nil },
         correlation: String? = nil,
         file: String = #fileID,
         function: String = #function,
@@ -532,7 +533,10 @@ public final class Logger: @unchecked Sendable {
             timestamp: Date(),
             level: level,
             message: message(),
-            metadata: metadata,
+            // Evaluated only here — after both the level gate and the
+            // active-destination gate — so a suppressed call never pays for
+            // building the dictionary.
+            metadata: metadata(),
             correlation: correlation,
             subsystem: subsystem,
             fileName: fileName ?? Self.lastPathComponent(of: file),
@@ -657,31 +661,31 @@ public let Log = Logger.shared
 // MARK: - Global Convenience Functions
 
 /// Logs a message at `.verbose` level.
-public func logVerbose(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+public func logVerbose(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .verbose, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.debug` level.
-public func logDebug(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+public func logDebug(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .debug, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.info` level.
-public func logInfo(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+public func logInfo(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .info, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.warning` level.
-public func logWarning(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+public func logWarning(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .warning, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.error` level.
-public func logError(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+public func logError(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .error, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.todo` level — marks incomplete work.
-public func logTODO(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+public func logTODO(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .todo, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }

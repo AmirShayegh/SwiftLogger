@@ -58,7 +58,7 @@ public struct ScopedLogger: Sendable {
     public func log(
         _ message: @autoclosure () -> String,
         level: LogLevel = .info,
-        metadata: LogMetadata? = nil,
+        metadata: @autoclosure () -> LogMetadata? = nil,
         file: String = #fileID,
         function: String = #function,
         line: Int = #line
@@ -67,7 +67,9 @@ public struct ScopedLogger: Sendable {
             message,
             level: level,
             subsystem: subsystem,
-            metadata: merged(metadata),
+            // Deferred: the caller's dictionary AND the merge with the scope's
+            // defaults are both skipped when the message is filtered out.
+            metadata: { merged(metadata()) },
             correlation: correlation,
             file: file,
             function: function,
@@ -75,28 +77,28 @@ public struct ScopedLogger: Sendable {
         )
     }
 
-    public func verbose(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
-        logger.logMessage(message, level: .verbose, subsystem: subsystem, metadata: merged(metadata), correlation: correlation, file: file, function: function, line: line)
+    public func verbose(_ message: @autoclosure () -> String, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+        logger.logMessage(message, level: .verbose, subsystem: subsystem, metadata: { merged(metadata()) }, correlation: correlation, file: file, function: function, line: line)
     }
 
-    public func debug(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
-        logger.logMessage(message, level: .debug, subsystem: subsystem, metadata: merged(metadata), correlation: correlation, file: file, function: function, line: line)
+    public func debug(_ message: @autoclosure () -> String, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+        logger.logMessage(message, level: .debug, subsystem: subsystem, metadata: { merged(metadata()) }, correlation: correlation, file: file, function: function, line: line)
     }
 
-    public func info(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
-        logger.logMessage(message, level: .info, subsystem: subsystem, metadata: merged(metadata), correlation: correlation, file: file, function: function, line: line)
+    public func info(_ message: @autoclosure () -> String, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+        logger.logMessage(message, level: .info, subsystem: subsystem, metadata: { merged(metadata()) }, correlation: correlation, file: file, function: function, line: line)
     }
 
-    public func warning(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
-        logger.logMessage(message, level: .warning, subsystem: subsystem, metadata: merged(metadata), correlation: correlation, file: file, function: function, line: line)
+    public func warning(_ message: @autoclosure () -> String, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+        logger.logMessage(message, level: .warning, subsystem: subsystem, metadata: { merged(metadata()) }, correlation: correlation, file: file, function: function, line: line)
     }
 
-    public func error(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
-        logger.logMessage(message, level: .error, subsystem: subsystem, metadata: merged(metadata), correlation: correlation, file: file, function: function, line: line)
+    public func error(_ message: @autoclosure () -> String, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+        logger.logMessage(message, level: .error, subsystem: subsystem, metadata: { merged(metadata()) }, correlation: correlation, file: file, function: function, line: line)
     }
 
-    public func todo(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
-        logger.logMessage(message, level: .todo, subsystem: subsystem, metadata: merged(metadata), correlation: correlation, file: file, function: function, line: line)
+    public func todo(_ message: @autoclosure () -> String, metadata: @autoclosure () -> LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
+        logger.logMessage(message, level: .todo, subsystem: subsystem, metadata: { merged(metadata()) }, correlation: correlation, file: file, function: function, line: line)
     }
 
     /// Creates a child scope, inheriting this scope's subsystem and metadata
