@@ -68,33 +68,81 @@ public final class FileDestination: @unchecked Sendable {
     /// after `flushInterval`.
     private var scheduledFlushIsImmediate = false
 
-    /// Entries buffered before new ones are dropped. Bounds the memory a burst
-    /// of logging can consume when the disk cannot keep up.
-    internal var maxBufferedEntries = 1_000
-    /// How long a partial buffer waits before being written.
-    internal var flushInterval: TimeInterval = 0.1
-    /// Buffer size that triggers an immediate write rather than waiting out the
-    /// interval.
-    ///
-    /// Clamped to the rotation threshold in `init`: buffering more than a whole
-    /// log file's worth guarantees blowing past `maxFileSize` before rotation
-    /// gets a chance to look, so the overshoot stays bounded by one batch.
-    internal var flushByteThreshold = defaultFlushByteThreshold
+    /// Buffering and recovery knobs, fixed at construction so no test or caller
+    /// can race a mutation against the write path.
+    internal struct Tunables {
+        /// Entries buffered before new ones are dropped. Bounds the memory a
+        /// burst of logging can consume when the disk cannot keep up.
+        var maxBufferedEntries = 1_000
+        /// How long a partial buffer waits before being written.
+        var flushInterval: TimeInterval = 0.1
+        /// Buffer size that triggers an immediate write rather than waiting out
+        /// the interval. `nil` uses the default, clamped to the rotation
+        /// threshold: buffering more than a whole log file's worth guarantees
+        /// blowing past `maxFileSize` before rotation gets a chance to look, so
+        /// the overshoot stays bounded by one batch.
+        var flushByteThreshold: Int? = nil
+        /// Minimum delay between attempts to reopen a lost file handle.
+        var reopenBackoff: TimeInterval = 1.0
+        /// Successful flushes between health checks of the open file handle.
+        var healthCheckStride = 8
+    }
+
+    internal let maxBufferedEntries: Int
+    internal let flushInterval: TimeInterval
+    internal let flushByteThreshold: Int
+    internal let reopenBackoff: TimeInterval
+    internal let healthCheckStride: Int
 
     internal static let defaultFlushByteThreshold = 4_096
 
-    public init?(
+    public convenience init?(
         url: URL,
         label: String = "file",
         minimumLevel: LogLevel? = nil,
         rotation: FileRotationConfig? = nil,
         formatter: any LogFormatter = DefaultLogFormatter()
     ) {
+        self.init(
+            url: url,
+            label: label,
+            minimumLevel: minimumLevel,
+            rotation: rotation,
+            formatter: formatter,
+            tunables: Tunables()
+        )
+    }
+
+    /// Designated initializer. `tunables:` has no default value, so the public
+    /// convenience above is never ambiguous with it.
+    internal init?(
+        url: URL,
+        label: String = "file",
+        minimumLevel: LogLevel? = nil,
+        rotation: FileRotationConfig? = nil,
+        formatter: any LogFormatter = DefaultLogFormatter(),
+        tunables: Tunables
+    ) {
         self.label = label
         self.fileURL = url
         self._minimumLevel = minimumLevel
         self.rotationConfig = rotation
         self.formatter = formatter
+
+        self.maxBufferedEntries = tunables.maxBufferedEntries
+        self.flushInterval = tunables.flushInterval
+        if let explicit = tunables.flushByteThreshold {
+            self.flushByteThreshold = explicit
+        } else if let maxFileSize = rotation?.maxFileSize {
+            self.flushByteThreshold = max(
+                1,
+                Int(min(maxFileSize, UInt64(Self.defaultFlushByteThreshold)))
+            )
+        } else {
+            self.flushByteThreshold = Self.defaultFlushByteThreshold
+        }
+        self.reopenBackoff = tunables.reopenBackoff
+        self.healthCheckStride = tunables.healthCheckStride
 
         if !FileManager.default.fileExists(atPath: url.path) {
             let dir = url.deletingLastPathComponent()
@@ -113,13 +161,6 @@ public final class FileDestination: @unchecked Sendable {
         self.currentFileStart = Self.creationDate(of: url)
         self.queue = DispatchQueue(label: "com.logger.filewriter.\(label)")
         self.queue.setSpecific(key: Self.queueKey, value: true)
-
-        if let maxFileSize = rotation?.maxFileSize {
-            self.flushByteThreshold = max(
-                1,
-                Int(min(maxFileSize, UInt64(Self.defaultFlushByteThreshold)))
-            )
-        }
     }
 
     /// Deprecated spelling of ``init(url:label:minimumLevel:rotation:formatter:)``.

@@ -28,9 +28,8 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("flush.log")
 
-            let fd = FileDestination(url: url)!
             // Long interval: only an explicit flush can get these to disk in time.
-            fd.flushInterval = 60
+            let fd = FileDestination(url: url, tunables: .init(flushInterval: 60))!
 
             fd.write(LogEntry(level: .info, message: "buffered one"))
             fd.write(LogEntry(level: .info, message: "buffered two"))
@@ -46,9 +45,10 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("coalesce.log")
 
-            let fd = FileDestination(url: url)!
-            fd.flushInterval = 60
-            fd.flushByteThreshold = 1_000_000  // never trip the size trigger
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(flushInterval: 60, flushByteThreshold: 1_000_000)  // never trip the size trigger
+            )!
 
             fd.write(LogEntry(level: .info, message: "still buffered"))
 
@@ -64,9 +64,10 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("timer.log")
 
-            let fd = FileDestination(url: url)!
-            fd.flushInterval = 0.02
-            fd.flushByteThreshold = 1_000_000
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(flushInterval: 0.02, flushByteThreshold: 1_000_000)
+            )!
 
             fd.write(LogEntry(level: .info, message: "timer driven"))
 
@@ -84,9 +85,10 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("threshold.log")
 
-            let fd = FileDestination(url: url)!
-            fd.flushInterval = 600  // effectively never
-            fd.flushByteThreshold = 200
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(flushInterval: 600, flushByteThreshold: 200)  // interval effectively never
+            )!
 
             for i in 0..<20 {
                 fd.write(LogEntry(level: .info, message: "threshold entry \(i)"))
@@ -104,11 +106,11 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("drop.log")
 
-            let fd = FileDestination(url: url)!
             // Hold everything in the buffer so the cap is reached deterministically.
-            fd.flushInterval = 600
-            fd.flushByteThreshold = 1_000_000
-            fd.maxBufferedEntries = 50
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(maxBufferedEntries: 50, flushInterval: 600, flushByteThreshold: 1_000_000)
+            )!
 
             let overflow = 17
             for i in 0..<(50 + overflow) {
@@ -133,10 +135,10 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("drop-one.log")
 
-            let fd = FileDestination(url: url)!
-            fd.flushInterval = 600
-            fd.flushByteThreshold = 1_000_000
-            fd.maxBufferedEntries = 2
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(maxBufferedEntries: 2, flushInterval: 600, flushByteThreshold: 1_000_000)
+            )!
 
             for i in 0..<3 { fd.write(LogEntry(level: .info, message: "x\(i)")) }
             fd.flush()
@@ -149,10 +151,10 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("drop-reset.log")
 
-            let fd = FileDestination(url: url)!
-            fd.flushInterval = 600
-            fd.flushByteThreshold = 1_000_000
-            fd.maxBufferedEntries = 2
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(maxBufferedEntries: 2, flushInterval: 600, flushByteThreshold: 1_000_000)
+            )!
 
             for i in 0..<4 { fd.write(LogEntry(level: .info, message: "a\(i)")) }
             fd.flush()
@@ -174,9 +176,10 @@ extension AllLoggerTests {
             let url = dir.appendingPathComponent("deinit.log")
 
             do {
-                let fd = FileDestination(url: url)!
-                fd.flushInterval = 600
-                fd.flushByteThreshold = 1_000_000
+                let fd = FileDestination(
+                    url: url,
+                    tunables: .init(flushInterval: 600, flushByteThreshold: 1_000_000)
+                )!
                 fd.write(LogEntry(level: .info, message: "written at deinit"))
                 // fd goes out of scope here with the entry still buffered.
             }
@@ -193,9 +196,10 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("crash.log")
 
-            let fd = FileDestination(url: url)!
-            fd.flushInterval = 600
-            fd.flushByteThreshold = 1_000_000
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(flushInterval: 600, flushByteThreshold: 1_000_000)
+            )!
 
             fd.write(LogEntry(level: .info, message: "led up to the crash"))
             fd.forceSave("CRASH REPORT")
@@ -211,8 +215,7 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("sustained.log")
 
-            let fd = FileDestination(url: url)!
-            fd.flushByteThreshold = 256
+            let fd = FileDestination(url: url, tunables: .init(flushByteThreshold: 256))!
 
             // A tight loop must not be able to starve the flush by continually
             // re-scheduling it.
@@ -234,8 +237,7 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("concurrent.log")
 
-            let fd = FileDestination(url: url)!
-            fd.flushByteThreshold = 512
+            let fd = FileDestination(url: url, tunables: .init(flushByteThreshold: 512))!
 
             let writers = 8
             let perWriter = 250

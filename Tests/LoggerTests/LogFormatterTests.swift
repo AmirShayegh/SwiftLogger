@@ -194,10 +194,11 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let url = dir.appendingPathComponent("dropped.log")
 
-            let fd = FileDestination(url: url, formatter: JSONLogFormatter())!
-            fd.flushInterval = 600
-            fd.flushByteThreshold = 1_000_000
-            fd.maxBufferedEntries = 2
+            let fd = FileDestination(
+                url: url,
+                formatter: JSONLogFormatter(),
+                tunables: .init(maxBufferedEntries: 2, flushInterval: 600, flushByteThreshold: 1_000_000)
+            )!
 
             for i in 0..<5 { fd.write(LogEntry(level: .info, message: "e\(i)")) }
             fd.flush()
