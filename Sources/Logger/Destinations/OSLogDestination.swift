@@ -9,7 +9,9 @@ import Foundation
 /// log data should implement a custom `LogDestination` using `%{private}@`.
 ///
 ///     Log.addDestination(OSLogDestination(subsystem: "com.myapp", category: "networking"))
-public final class OSLogDestination: LogDestination, @unchecked Sendable {
+/// Every stored property is an immutable `Sendable` value — `os.Logger` is
+/// itself `Sendable` — so this needs no `@unchecked` escape hatch and no lock.
+public final class OSLogDestination: LogDestination, Sendable {
     public let label: String
     public let minimumLevel: LogLevel?
     public var isEnabled: Bool { true }

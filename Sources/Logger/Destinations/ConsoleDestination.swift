@@ -24,8 +24,19 @@ public final class ConsoleDestination: LogDestination, @unchecked Sendable {
         return printOn || hasSink
     }
 
+    /// The level below which this destination discards entries.
+    ///
+    /// Every other destination takes its level at construction and keeps it
+    /// immutable; this one is mutable purely for historical reasons, and a
+    /// mid-flight change races the entries already in the pipeline. The setter
+    /// is deprecated — construct a replacement and hand it to
+    /// ``Logger/addDestination(_:)`` instead, which swaps atomically.
+    ///
+    /// Deprecation is scoped to the setter. Marking the whole property would
+    /// warn on every read and on the `LogDestination` protocol witness.
     public var minimumLevel: LogLevel? {
         get { lock.lock(); defer { lock.unlock() }; return _minimumLevel }
+        @available(*, deprecated, message: "Set the level at construction: addDestination(ConsoleDestination(minimumLevel:))")
         set { lock.lock(); _minimumLevel = newValue; lock.unlock() }
     }
 
