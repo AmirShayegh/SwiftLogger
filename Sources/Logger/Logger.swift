@@ -41,10 +41,23 @@ public final class Logger: @unchecked Sendable {
     private var _exceptionHandlerInstalled = false
     private var _previousExceptionHandler: (@convention(c) (NSException) -> Void)?
 
-    internal static let defaultRegistrar: (@convention(c) (NSException) -> Void) -> Void = {
+    /// Installs a process-wide uncaught-exception handler, or clears it when
+    /// passed `nil`. Nullable because ``reset()`` has to be able to restore a
+    /// pre-install state that had no handler at all.
+    internal typealias ExceptionHandlerRegistrar = ((@convention(c) (NSException) -> Void)?) -> Void
+
+    internal static let defaultRegistrar: ExceptionHandlerRegistrar = {
         NSSetUncaughtExceptionHandler($0)
     }
-    internal var exceptionHandlerRegistrar: (@convention(c) (NSException) -> Void) -> Void = Logger.defaultRegistrar
+    internal var exceptionHandlerRegistrar: ExceptionHandlerRegistrar = Logger.defaultRegistrar
+
+    /// The registrar that actually installed the trampoline.
+    ///
+    /// ``reset()`` restores through *this*, not through whatever
+    /// `exceptionHandlerRegistrar` happens to hold now. A test that swapped in
+    /// a fake registrar never touched the real process handler, so restoring
+    /// via `NSSetUncaughtExceptionHandler` would clobber the test host's.
+    private var _installRegistrar: ExceptionHandlerRegistrar?
 
     private init() {
         _config = .makeDefault()
@@ -320,6 +333,7 @@ public final class Logger: @unchecked Sendable {
         _previousExceptionHandler = NSGetUncaughtExceptionHandler()
         _exceptionHandlerInstalled = true
         let registrar = exceptionHandlerRegistrar
+        _installRegistrar = registrar
         writeLock.unlock()
 
         registrar { exception in
@@ -564,17 +578,38 @@ public final class Logger: @unchecked Sendable {
         consoleDestination?.setOutputSink(sink)
     }
 
+    /// Returns the logger to its as-launched state.
+    ///
+    /// Exception-handler invariants, in the order they matter:
+    ///
+    /// - Reset without a prior install never calls any registrar. Uninstalling
+    ///   a handler this logger did not install is not this logger's business.
+    /// - An install followed by a reset restores whatever
+    ///   `NSGetUncaughtExceptionHandler()` returned *before* the install —
+    ///   including `nil` — through the registrar that performed the install.
+    /// - Consequently install → reset → install reads the genuine pre-install
+    ///   handler as its "previous", never this logger's own trampoline. Without
+    ///   the restore, the second install chains the trampoline to itself and
+    ///   the first uncaught exception recurses until the stack runs out.
+    /// - A second reset is a no-op, because the first cleared the flag.
     internal func reset() {
         writeLock.lock()
         let outgoing = configLock.withLock { _config }
         configLock.withLock { _config = .makeDefault() }
+        let restore: (registrar: ExceptionHandlerRegistrar, handler: (@convention(c) (NSException) -> Void)?)?
+            = _exceptionHandlerInstalled ? (_installRegistrar ?? Self.defaultRegistrar, _previousExceptionHandler) : nil
         _exceptionHandlerInstalled = false
         _previousExceptionHandler = nil
+        _installRegistrar = nil
         exceptionHandlerRegistrar = Self.defaultRegistrar
         writeLock.unlock()
 
-        // Drain and release outside the lock, for the same reason mutateConfig
-        // does: both run the user's formatter, which may reconfigure the logger.
+        // Outside the lock: the registrar is caller-supplied, and the drain and
+        // release below run the user's formatter, which may reconfigure the
+        // logger. Same reasoning as mutateConfig.
+        if let restore {
+            restore.registrar(restore.handler)
+        }
         for destination in outgoing.destinations {
             destination.flush()
         }

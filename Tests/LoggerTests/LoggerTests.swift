@@ -116,26 +116,8 @@ struct AllLoggerTests {
             Logger.shared.removeDestination(label: "crashlog")
         }
 
-        @Test func exceptionHandlerUsesRegistrar() {
-            var handlerWasRegistered = false
-            Logger.shared.exceptionHandlerRegistrar = { _ in
-                handlerWasRegistered = true
-            }
-            #expect(!Logger.shared.isExceptionHandlerInstalled)
-            Logger.shared.installExceptionHandler()
-            #expect(Logger.shared.isExceptionHandlerInstalled)
-            #expect(handlerWasRegistered)
-        }
-
-        @Test func exceptionHandlerIsIdempotent() {
-            var registrationCount = 0
-            Logger.shared.exceptionHandlerRegistrar = { _ in
-                registrationCount += 1
-            }
-            Logger.shared.installExceptionHandler()
-            Logger.shared.installExceptionHandler()
-            #expect(registrationCount == 1)
-        }
+        // Exception-handler coverage lives in ExceptionHandlerTests, which
+        // saves and restores the process-global handler around every case.
     }
 
     // MARK: - Subsystems
