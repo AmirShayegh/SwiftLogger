@@ -36,7 +36,11 @@ public struct FileRotationConfig: Sendable {
 }
 
 public final class FileDestination: @unchecked Sendable {
-    private static let queueKey = DispatchSpecificKey<Bool>()
+    /// Per-instance on purpose. A class-wide key would make
+    /// `getSpecific` answer "am I on *some* file destination's queue?",
+    /// so a sibling's thread would run this instance's work inline and
+    /// touch its queue-confined state from the wrong queue.
+    private let queueKey = DispatchSpecificKey<Bool>()
     public let label: String
     private let queue: DispatchQueue
     private let fileURL: URL
@@ -74,7 +78,12 @@ public final class FileDestination: @unchecked Sendable {
     private let stateLock = UnfairLock()
     private var pending = Data()
     private var pendingCount = 0
+    /// Entries refused because the buffer was full.
     private var droppedCount = 0
+    /// Entries lost because a write failed or no handle was available.
+    /// Counted separately from `droppedCount` so the notice names the real
+    /// cause: a full disk and a full buffer call for very different responses.
+    private var writeFailureCount = 0
     private var scheduledFlush: DispatchWorkItem?
     /// Whether `scheduledFlush` was dispatched to run immediately rather than
     /// after `flushInterval`.
@@ -169,7 +178,7 @@ public final class FileDestination: @unchecked Sendable {
         self.currentFileSize = opened.handle.seekToEndOfFile()
         self.currentFileStart = Self.creationDate(of: url)
         self.queue = DispatchQueue(label: "com.logger.filewriter.\(label)")
-        self.queue.setSpecific(key: Self.queueKey, value: true)
+        self.queue.setSpecific(key: queueKey, value: true)
     }
 
     /// Opens `url` for appending, creating the file if needed. Every open in
@@ -228,36 +237,40 @@ public final class FileDestination: @unchecked Sendable {
         // held `self` strongly for its duration and has already drained, and this
         // block captures only the handle and the leftover bytes — never `self`.
         let handle = fileHandle
-        let (chunk, dropped) = stateLock.withLock { () -> (Data, Int) in
+        let url = fileURL
+        let snapshot = stateLock.withLock { () -> Snapshot in
             scheduledFlush?.cancel()
             scheduledFlush = nil
-
             scheduledFlushIsImmediate = false
-            let data = pending
-            let droppedNow = droppedCount
-            droppedCount = 0
-            pending = Data()
-            pendingCount = 0
-            return (data, droppedNow)
+            return takeSnapshotLocked()
         }
 
         // The drop notice is rendered outside stateLock — the formatter is
         // user code (see performFlush).
-        var remaining = chunk
-        if dropped > 0 {
-            remaining.append(droppedNoticeData(count: dropped))
-        }
+        let remaining = payload(for: snapshot)
 
         queue.async {
-            guard let handle else { return }
-            if !remaining.isEmpty {
+            guard !remaining.isEmpty else {
+                try? handle?.synchronize()
+                try? handle?.close()
+                return
+            }
+            if let handle {
                 // Last chance: the destination is going away, so a write
                 // failure here has no counter left to report into. try? is
                 // deliberate.
                 try? handle.write(contentsOf: remaining)
+                try? handle.synchronize()
+                try? handle.close()
+            } else if let recovered = FileDestination.openForAppending(at: url) {
+                // Degraded at deallocation. The path may well be writable again
+                // by now, so make one last attempt rather than discarding the
+                // tail — these are the entries an app loses at shutdown, which
+                // are usually the ones explaining why it shut down.
+                try? recovered.handle.write(contentsOf: remaining)
+                try? recovered.handle.synchronize()
+                try? recovered.handle.close()
             }
-            try? handle.synchronize()
-            try? handle.close()
         }
     }
 
@@ -268,16 +281,17 @@ public final class FileDestination: @unchecked Sendable {
         let work = { [self] in
             // Drain anything buffered first so the crash log lands after the
             // entries that led up to it rather than jumping ahead of them.
-            self.performFlush()
-            // Crash path: there is no later flush to defer to, so a degraded
-            // destination reopens immediately rather than waiting out the
-            // backoff, and a failed write retries once through a fresh handle.
-            if self.fileHandle == nil {
-                self.attemptReopen()
-            }
-            if (try? self.fileHandle?.write(contentsOf: data)) != nil {
+            //
+            // ignoringBackoff: this is the crash path. There is no later flush
+            // to defer to, so a degraded destination must retry the open now
+            // instead of waiting out the backoff and discarding exactly the
+            // entries that led up to the crash.
+            self.performFlush(ignoringBackoff: true)
+
+            if (try? self.writableHandle(ignoringBackoff: true)?.write(contentsOf: data)) != nil {
                 self.currentFileSize += UInt64(data.count)
             } else {
+                // The handle died on this very write; replace it and retry once.
                 self.attemptReopen()
                 if (try? self.fileHandle?.write(contentsOf: data)) != nil {
                     self.currentFileSize += UInt64(data.count)
@@ -285,7 +299,18 @@ public final class FileDestination: @unchecked Sendable {
             }
             try? self.fileHandle?.synchronize()
         }
-        if DispatchQueue.getSpecific(key: Self.queueKey) == true {
+        runOnQueue(work)
+    }
+
+    /// Runs `work` on the write queue, inline if already there.
+    ///
+    /// `queue.sync` onto a queue the current thread already owns traps, so the
+    /// specific-key check is load-bearing. The key is per-instance: a
+    /// class-wide one would answer "on *some* file destination's queue", and
+    /// running inline on a sibling's thread would touch this instance's
+    /// queue-confined state from the wrong queue.
+    private func runOnQueue(_ work: () -> Void) {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
             work()
         } else {
             queue.sync(execute: work)
@@ -294,10 +319,51 @@ public final class FileDestination: @unchecked Sendable {
 
     // MARK: - Buffering
 
-    private func droppedNoticeData(count: Int) -> Data {
+    /// One drained batch plus the losses that need reporting alongside it.
+    private struct Snapshot {
+        var chunk = Data()
+        var batchCount = 0
+        var dropped = 0
+        var writeFailures = 0
+
+        var hasContent: Bool { !chunk.isEmpty || dropped > 0 || writeFailures > 0 }
+        /// Everything this batch represents, for accounting a failed write.
+        var totalEntries: Int { batchCount + dropped + writeFailures }
+    }
+
+    /// Empties the buffer and its counters. Caller must hold `stateLock`.
+    private func takeSnapshotLocked() -> Snapshot {
+        var snapshot = Snapshot()
+        snapshot.chunk = pending
+        snapshot.batchCount = pendingCount
+        snapshot.dropped = droppedCount
+        snapshot.writeFailures = writeFailureCount
+        pending = Data()
+        pendingCount = 0
+        droppedCount = 0
+        writeFailureCount = 0
+        return snapshot
+    }
+
+    /// The bytes to write for `snapshot`, notices included.
+    ///
+    /// Must be called with `stateLock` released: rendering a notice runs the
+    /// user's formatter, which may log back into this destination.
+    private func payload(for snapshot: Snapshot) -> Data {
+        var data = snapshot.chunk
+        if snapshot.dropped > 0 {
+            data.append(noticeData(count: snapshot.dropped, reason: "write buffer full"))
+        }
+        if snapshot.writeFailures > 0 {
+            data.append(noticeData(count: snapshot.writeFailures, reason: "could not be written to \(fileURL.lastPathComponent)"))
+        }
+        return data
+    }
+
+    private func noticeData(count: Int, reason: String) -> Data {
         let entry = LogEntry(
             level: .warning,
-            message: "[Logger] dropped \(count) message\(count == 1 ? "" : "s") — write buffer full",
+            message: "[Logger] dropped \(count) message\(count == 1 ? "" : "s") — \(reason)",
             fileName: "FileDestination.swift"
         )
         // Rendered with this destination's formatter so the notice is parseable
@@ -375,52 +441,45 @@ public final class FileDestination: @unchecked Sendable {
     }
 
     /// Writes the buffered bytes. Runs only on the serial queue.
-    private func performFlush() {
-        let (chunk, batchCount, dropped) = stateLock.withLock { () -> (Data, Int, Int) in
+    ///
+    /// `ignoringBackoff` is for the explicit-durability paths (``flush()`` and
+    /// ``forceSave(_:)``), where the caller is asking for the buffer to be on
+    /// disk *now*; waiting out a reopen backoff there would simply discard it.
+    private func performFlush(ignoringBackoff: Bool = false) {
+        let snapshot = stateLock.withLock { () -> Snapshot in
             // Clearing `scheduledFlush` before the write means a `write()` racing
             // with it schedules a fresh flush, which the serial queue runs after
             // this one. Clearing it afterwards could lose that wakeup.
             scheduledFlush = nil
-
             scheduledFlushIsImmediate = false
-            let data = pending
-            let count = pendingCount
-            let droppedNow = droppedCount
-            droppedCount = 0
-            pending = Data()
-            pendingCount = 0
-            return (data, count, droppedNow)
+            return takeSnapshotLocked()
         }
 
-        guard !chunk.isEmpty || dropped > 0 else { return }
+        guard snapshot.hasContent else { return }
 
-        // The drop notice is rendered outside stateLock: the formatter is user
-        // code and may log back into this destination, and re-entering the
+        // Notices are rendered outside stateLock: the formatter is user code
+        // and may log back into this destination, and re-entering the
         // non-recursive stateLock would abort the process.
-        var payload = chunk
-        if dropped > 0 {
-            payload.append(droppedNoticeData(count: dropped))
-        }
+        let bytes = payload(for: snapshot)
 
-        guard let handle = liveHandle() else {
+        guard let handle = writableHandle(ignoringBackoff: ignoringBackoff) else {
             // Still degraded. The bytes are lost but counted, and the buffer
             // keeps cycling so the cap semantics hold rather than wedging.
-            recordWriteFailure(batchCount + dropped)
+            recordWriteFailure(snapshot.totalEntries)
             return
         }
 
         do {
-            try handle.write(contentsOf: payload)
-            currentFileSize += UInt64(payload.count)
+            try handle.write(contentsOf: bytes)
+            currentFileSize += UInt64(bytes.count)
             checkHandleHealthPeriodically()
             rotateIfNeeded()
         } catch {
-            // The bytes are gone — count them as dropped so the next
-            // successful flush reports the loss. Deliberately not re-prepended
-            // to the buffer: a persistent outage (ENOSPC lasts seconds to
-            // minutes) would rewrite the buffer head on every retry for the
-            // same net loss.
-            recordWriteFailure(batchCount + dropped)
+            // The bytes are gone — count them so the next successful flush
+            // reports the loss. Deliberately not re-prepended to the buffer: a
+            // persistent outage (ENOSPC lasts seconds to minutes) would rewrite
+            // the buffer head on every retry for the same net loss.
+            recordWriteFailure(snapshot.totalEntries)
             // A failed write usually means the descriptor died rather than the
             // disk filling for one batch. ENOSPC leaves the handle linked, so
             // this keeps it; a revoked descriptor gets replaced.
@@ -430,11 +489,17 @@ public final class FileDestination: @unchecked Sendable {
 
     // MARK: - Handle liveness (runs exclusively on serial queue)
 
-    /// The handle to write through, reopening a degraded destination once the
+    /// The handle to write through, reopening a degraded destination when the
     /// backoff has elapsed. `nil` means still degraded.
-    private func liveHandle() -> FileHandle? {
+    ///
+    /// `ignoringBackoff` skips the throttle for callers that cannot come back
+    /// later — ``flush()`` and ``forceSave(_:)`` — because for them the
+    /// alternative to retrying now is discarding the buffer.
+    private func writableHandle(ignoringBackoff: Bool = false) -> FileHandle? {
         if let handle = fileHandle { return handle }
-        guard Date().timeIntervalSince(lastReopenAttempt) >= reopenBackoff else { return nil }
+        guard ignoringBackoff || Date().timeIntervalSince(lastReopenAttempt) >= reopenBackoff else {
+            return nil
+        }
         attemptReopen()
         return fileHandle
     }
@@ -503,11 +568,11 @@ public final class FileDestination: @unchecked Sendable {
         attemptReopen()
     }
 
-    /// Folds a failed write's entries into the dropped count so the next
-    /// successful flush reports them.
+    /// Records entries lost to a write failure so the next successful flush
+    /// reports them, attributed to the write rather than to the buffer cap.
     private func recordWriteFailure(_ lost: Int) {
         guard lost > 0 else { return }
-        stateLock.withLock { droppedCount += lost }
+        stateLock.withLock { writeFailureCount += lost }
     }
 
     // MARK: - Test Support
@@ -653,16 +718,14 @@ extension FileDestination: LogDestination {
             scheduledFlush = nil
         }
 
-        let work = { [self] in
-            self.performFlush()
+        // ignoringBackoff: flush() promises the buffer is on storage when it
+        // returns. A degraded destination inside its reopen backoff would
+        // otherwise silently discard the buffer and still return — which is
+        // exactly the applicationWillTerminate case, where the discarded
+        // entries are the ones explaining the shutdown.
+        runOnQueue { [self] in
+            self.performFlush(ignoringBackoff: true)
             try? self.fileHandle?.synchronize()
-        }
-        // Same reasoning as `forceSave`: `queue.sync` from the queue's own thread
-        // would trap, so run inline when we are already on it.
-        if DispatchQueue.getSpecific(key: Self.queueKey) == true {
-            work()
-        } else {
-            queue.sync(execute: work)
         }
     }
 }

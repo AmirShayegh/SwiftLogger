@@ -503,5 +503,143 @@ extension AllLoggerTests {
             let content = try String(contentsOf: url, encoding: .utf8)
             #expect(content.contains("buffered before removal"))
         }
+
+        @Test func addDestinationDrainsTheDestinationItDisplaces() throws {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("logger-test-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            let url = tmp.appendingPathComponent("displaced.log")
+
+            Logger.shared.consoleLogging(false)
+            Logger.shared.addDestination(FileDestination(url: url, label: "swapped")!)
+            Logger.shared.log("buffered in predecessor", level: .info)
+
+            // addDestination replaces a same-labelled destination. The one being
+            // displaced is about to be released, so its buffer has to be drained
+            // as part of the swap rather than left to the deinit race.
+            Logger.shared.addDestination(FileDestination(url: url, label: "swapped")!)
+
+            let content = try String(contentsOf: url, encoding: .utf8)
+            #expect(content.contains("buffered in predecessor"))
+        }
+
+        @Test func disablingFileLoggingDrainsTheBuffer() throws {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("logger-test-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            let url = tmp.appendingPathComponent("disabled.log")
+
+            Logger.shared.consoleLogging(false)
+            Logger.shared.fileLogging(url: url, label: "file")
+            Logger.shared.log("buffered before disable", level: .info)
+            Logger.shared.fileLogging(false)
+
+            let content = try String(contentsOf: url, encoding: .utf8)
+            #expect(content.contains("buffered before disable"))
+        }
+
+        /// A formatter that reconfigures the logger while rendering a drop
+        /// notice. Real formatters reach back into the logger for diagnostics,
+        /// and the notice is the one line rendered from inside the drain.
+        private final class ReconfiguringFormatter: LogFormatter, @unchecked Sendable {
+            private let lock = NSLock()
+            private var _reentered = false
+            var reentered: Bool { lock.withLock { _reentered } }
+
+            func format(_ entry: LogEntry) -> String {
+                if entry.message.contains("dropped") {
+                    lock.withLock { _reentered = true }
+                    Logger.shared.minimumLevel(.debug)
+                }
+                return entry.message
+            }
+        }
+
+        /// Runs `work` on a background thread, failing rather than hanging the
+        /// whole suite if it never returns.
+        private func expectCompletes(
+            within timeout: TimeInterval = 10,
+            _ description: String,
+            _ work: @escaping @Sendable () -> Void
+        ) {
+            let done = DispatchSemaphore(value: 0)
+            Thread.detachNewThread {
+                work()
+                done.signal()
+            }
+            #expect(done.wait(timeout: .now() + timeout) == .success, "\(description) did not return")
+        }
+
+        @Test func retiringADestinationWhoseFormatterReconfiguresDoesNotDeadlock() throws {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("logger-test-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            let url = tmp.appendingPathComponent("reentrant-retire.log")
+
+            let formatter = ReconfiguringFormatter()
+            let fd = FileDestination(
+                url: url,
+                label: "reentrant",
+                formatter: formatter,
+                tunables: .init(maxBufferedEntries: 2, flushInterval: 600, flushByteThreshold: 1_000_000)
+            )!
+
+            Logger.shared.consoleLogging(false)
+            Logger.shared.addDestination(fd)
+            // Overflow the buffer so the drain has a drop notice to render —
+            // that notice is what runs the user's formatter.
+            for i in 0..<6 { fd.write(LogEntry(level: .info, message: "kept \(i)")) }
+
+            // removeDestination drains the outgoing destination. If that drain
+            // happens while writeLock is held, the formatter's minimumLevel call
+            // blocks on the very lock this thread owns and nothing ever returns.
+            expectCompletes("removeDestination") {
+                Logger.shared.removeDestination(label: "reentrant")
+            }
+            #expect(formatter.reentered)
+        }
+
+        @Test func resetWithAReconfiguringFormatterDoesNotDeadlock() throws {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("logger-test-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            let url = tmp.appendingPathComponent("reentrant-reset.log")
+
+            let formatter = ReconfiguringFormatter()
+            let fd = FileDestination(
+                url: url,
+                label: "reentrant",
+                formatter: formatter,
+                tunables: .init(maxBufferedEntries: 2, flushInterval: 600, flushByteThreshold: 1_000_000)
+            )!
+
+            Logger.shared.consoleLogging(false)
+            Logger.shared.addDestination(fd)
+            for i in 0..<6 { fd.write(LogEntry(level: .info, message: "kept \(i)")) }
+
+            expectCompletes("reset") {
+                Logger.shared.reset()
+            }
+            #expect(formatter.reentered)
+        }
+
+        @Test func resetDrainsFileDestinationBuffers() throws {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("logger-test-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            let url = tmp.appendingPathComponent("reset.log")
+
+            Logger.shared.consoleLogging(false)
+            Logger.shared.fileLogging(url: url, label: "custom")
+            Logger.shared.log("buffered before reset", level: .info)
+
+            // reset() drops every destination at once. Each one is the last
+            // reference to its write queue, so the buffers must be drained
+            // before the release or the tail of the log is simply gone.
+            Logger.shared.reset()
+
+            let content = try String(contentsOf: url, encoding: .utf8)
+            #expect(content.contains("buffered before reset"))
+        }
     }
 }

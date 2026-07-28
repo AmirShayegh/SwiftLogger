@@ -377,6 +377,162 @@ extension AllLoggerTests {
             #expect(content.contains("dropped 1 message —"))
         }
 
+        // MARK: - Degraded-state durability
+
+        /// Degrades `fd` by making its path un-openable, then restores the path
+        /// while leaving the destination degraded and inside its backoff.
+        private func degradeThenRestore(_ fd: FileDestination, at url: URL) throws {
+            // Kill the descriptor, then park a directory on the path so the
+            // recovery reopen fails with EISDIR and the destination goes
+            // degraded rather than quietly reopening.
+            fd.closeHandleForTesting()
+            try FileManager.default.removeItem(at: url)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+            fd.write(LogEntry(level: .info, message: "degrading write"))
+            fd.flush()
+            #expect(!fd.isHealthyForTesting)
+            // Path is writable again, but the destination will not retry until
+            // reopenBackoff elapses — which is the window under test.
+            try FileManager.default.removeItem(at: url)
+        }
+
+        @Test func forceSavePreservesTheBufferedTailWhenDegraded() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("crash-degraded.log")
+
+            // Long backoff so the destination is definitely still throttled.
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(flushInterval: 600, flushByteThreshold: 1_000_000, reopenBackoff: 600)
+            )!
+            try degradeThenRestore(fd, at: url)
+
+            fd.write(LogEntry(level: .error, message: "LEADING_UP_TO_CRASH"))
+            fd.forceSave("CRASH REPORT")
+
+            // forceSave used to drain the buffer *before* attempting a reopen,
+            // so a degraded destination wrote the crash text alone and threw
+            // away exactly the entries explaining it.
+            let content = contents(of: url)
+            #expect(content.contains("LEADING_UP_TO_CRASH"))
+            #expect(content.contains("CRASH REPORT"))
+            let leadUp = try #require(content.range(of: "LEADING_UP_TO_CRASH"))
+            let crash = try #require(content.range(of: "CRASH REPORT"))
+            #expect(leadUp.lowerBound < crash.lowerBound)
+        }
+
+        @Test func flushPreservesTheBufferWhenDegraded() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("flush-degraded.log")
+
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(flushInterval: 600, flushByteThreshold: 1_000_000, reopenBackoff: 600)
+            )!
+            try degradeThenRestore(fd, at: url)
+
+            fd.write(LogEntry(level: .info, message: "MUST_BE_ON_DISK"))
+            fd.flush()
+
+            // flush() promises the buffer is on storage when it returns. Waiting
+            // out the backoff and discarding it instead is the
+            // applicationWillTerminate data-loss case.
+            #expect(contents(of: url).contains("MUST_BE_ON_DISK"))
+        }
+
+        @Test func deinitPreservesTheBufferWhenDegraded() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("deinit-degraded.log")
+
+            do {
+                let fd = FileDestination(
+                    url: url,
+                    tunables: .init(flushInterval: 600, flushByteThreshold: 1_000_000, reopenBackoff: 600)
+                )!
+                try degradeThenRestore(fd, at: url)
+                fd.write(LogEntry(level: .info, message: "FINAL_TAIL"))
+                // fd goes out of scope degraded, with the entry still buffered.
+            }
+
+            let deadline = Date().addingTimeInterval(5)
+            while !contents(of: url).contains("FINAL_TAIL") && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            #expect(contents(of: url).contains("FINAL_TAIL"))
+        }
+
+        @Test func reopenIsThrottledByTheBackoffOnTheBackgroundPath() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("throttled.log")
+
+            // flushByteThreshold 1 makes every write drive an immediate
+            // background flush, which is the path the backoff governs.
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(flushByteThreshold: 1, reopenBackoff: 600)
+            )!
+            try degradeThenRestore(fd, at: url)
+
+            // The path is writable again, but ordinary buffered writes must NOT
+            // retry the open until the backoff elapses — without that throttle a
+            // persistently failing destination hammers the filesystem on every
+            // single flush.
+            for i in 0..<20 {
+                fd.write(LogEntry(level: .info, message: "still degraded \(i)"))
+            }
+            // Deliberately not fd.flush(): that path ignores the backoff by
+            // design. Let the background flushes run instead.
+            Thread.sleep(forTimeInterval: 0.2)
+            #expect(!fd.isHealthyForTesting)
+            #expect(!FileManager.default.fileExists(atPath: url.path))
+
+            // Same situation, zero backoff: the very next background flush
+            // recovers, so the throttle above is the backoff and not a
+            // permanently wedged destination.
+            let promptURL = dir.appendingPathComponent("prompt.log")
+            let prompt = FileDestination(
+                url: promptURL,
+                tunables: .init(flushByteThreshold: 1, reopenBackoff: 0)
+            )!
+            try degradeThenRestore(prompt, at: promptURL)
+            prompt.write(LogEntry(level: .info, message: "RECOVERED_IN_BACKGROUND"))
+
+            let deadline = Date().addingTimeInterval(5)
+            while !contents(of: promptURL).contains("RECOVERED_IN_BACKGROUND") && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            #expect(contents(of: promptURL).contains("RECOVERED_IN_BACKGROUND"))
+        }
+
+        @Test func writeFailuresAreReportedSeparatelyFromBufferOverflow() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("attribution.log")
+
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(flushInterval: 600, flushByteThreshold: 1_000_000, reopenBackoff: 0)
+            )!
+
+            fd.write(LogEntry(level: .info, message: "casualty"))
+            fd.closeHandleForTesting()
+            fd.flush()
+            fd.write(LogEntry(level: .info, message: "after"))
+            fd.flush()
+
+            // A dead descriptor and a full buffer call for completely different
+            // responses, so the notice must not blame the buffer for a write
+            // failure — an operator would raise maxBufferedEntries and never
+            // look at the real fault.
+            let content = contents(of: url)
+            #expect(content.contains("could not be written to attribution.log"))
+            #expect(!content.contains("write buffer full"))
+        }
+
         @Test func rotationThresholdClampsTheBufferSize() throws {
             let dir = try makeTempDir()
             defer { try? FileManager.default.removeItem(at: dir) }

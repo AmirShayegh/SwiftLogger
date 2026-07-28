@@ -101,17 +101,31 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("test.log")
 
-            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 50, maxArchivedFilesCount: 5))!
+            // Each setup line on its own exceeds maxFileSize, so rotation fires
+            // on every setup batch no matter how GCD coalesced the writes, and
+            // currentFileSize is deterministically 0 when the marker is written.
+            //
+            // With the old sizing (50-byte limit, 48-byte lines) the outcome
+            // depended on batching: if the last batch happened to be a partial
+            // one, the residual plus the 41-byte marker crossed the threshold
+            // and rotation archived the marker, leaving the current file empty.
+            // That failed roughly 1 run in 100.
+            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 100, maxArchivedFilesCount: 5))!
 
             for i in 0..<10 {
-                fd.write(LogEntry(level: .info, message: "old entry \(i) padding"))
+                fd.write(LogEntry(level: .info, message: "old entry \(i) " + String(repeating: "padding ", count: 20)))
             }
             fd.flush()
 
-            // The current file should exist and be writable
+            // Rotation really did happen, so the marker below is genuinely
+            // landing in a post-rotation file rather than a never-rotated one.
+            #expect(!archives(in: dir, baseName: "test.log").isEmpty)
+
             fd.write(LogEntry(level: .info, message: "FRESH_MARKER"))
             fd.flush()
 
+            // Deliberately reads the current file only, not the archives: the
+            // point of this test is that writes resume into the *fresh* file.
             let content = try String(contentsOf: logURL, encoding: .utf8)
             #expect(content.contains("FRESH_MARKER"))
         }

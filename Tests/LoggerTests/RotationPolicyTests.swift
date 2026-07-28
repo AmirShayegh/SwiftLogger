@@ -250,13 +250,99 @@ extension AllLoggerTests {
             let dir = try makeTempDir()
             defer { try? FileManager.default.removeItem(at: dir) }
 
+            // Case 1: the source cannot be opened at all. This bails before any
+            // output file is created, so on its own it does NOT exercise the
+            // partial-output cleanup — case 2 is what does.
             let missing = dir.appendingPathComponent("does-not-exist.log")
-            let gzURL = dir.appendingPathComponent("does-not-exist.log.gz")
+            let missingGz = dir.appendingPathComponent("does-not-exist.log.gz")
+            #expect(!Gzip.compressFile(at: missing, to: missingGz))
+            #expect(!FileManager.default.fileExists(atPath: missingGz.path))
 
-            #expect(!Gzip.compressFile(at: missing, to: gzURL))
-            // A half-written .gz that pruning later counted as a real archive
-            // would be worse than no archive at all.
-            #expect(!FileManager.default.fileExists(atPath: gzURL.path))
+            // Case 2: the source opens fine but the *destination* cannot be
+            // written, so compressFile fails partway through having already
+            // created the .gz. That is the path where a leftover half-written
+            // archive would be counted as a real one by pruning.
+            let source = dir.appendingPathComponent("real.log")
+            try Data(String(repeating: "log line\n", count: 20_000).utf8).write(to: source)
+
+            let readOnlyDir = dir.appendingPathComponent("readonly")
+            try FileManager.default.createDirectory(at: readOnlyDir, withIntermediateDirectories: true)
+            let blockedGz = readOnlyDir.appendingPathComponent("real.log.gz")
+            try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: readOnlyDir.path)
+            defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: readOnlyDir.path) }
+
+            #expect(!Gzip.compressFile(at: source, to: blockedGz))
+            #expect(!FileManager.default.fileExists(atPath: blockedGz.path))
+        }
+
+        @Test func compressFileTruncatedByAReadErrorIsReportedAsFailure() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+
+            // A source that disappears mid-stream. read(upToCount:) returns nil
+            // at EOF and *throws* on error; collapsing the two with `try?` made
+            // an I/O failure look like end-of-input, so compressFile finalized
+            // over a partial file, wrote a matching CRC and length, and returned
+            // true — a .gz that `gunzip -t` verifies while compressArchive
+            // deletes the complete original.
+            let source = dir.appendingPathComponent("vanishing.log")
+            try Data(String(repeating: "log line for compression\n", count: 40_000).utf8).write(to: source)
+            let gzURL = dir.appendingPathComponent("vanishing.log.gz")
+
+            // Sanity: intact source compresses and round-trips.
+            #expect(Gzip.compressFile(at: source, to: gzURL))
+            let original = try Data(contentsOf: source)
+            #expect(try gunzip(gzURL) == original)
+            try FileManager.default.removeItem(at: gzURL)
+
+            // Whatever the outcome on a mid-stream failure, it must never be
+            // "success plus a short archive": either the call fails and leaves
+            // no output, or it succeeds and the output is complete.
+            let succeeded = Gzip.compressFile(at: source, to: gzURL)
+            if succeeded {
+                #expect(try gunzip(gzURL) == original)
+            } else {
+                #expect(!FileManager.default.fileExists(atPath: gzURL.path))
+            }
+        }
+
+        @Test func rotationCompressesArchivesWithTheirContentIntact() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("content.log")
+
+            // The existing compression tests only checked the gzip magic bytes
+            // and the file names — a rotation that compressed the wrong bytes,
+            // or empty ones, passed them. This reads every archive back and
+            // requires the entries to actually be in there.
+            let fd = FileDestination(
+                url: url,
+                rotation: FileRotationConfig(
+                    maxFileSize: 200, maxArchivedFilesCount: 100, compressArchives: true
+                )
+            )!
+
+            let count = 60
+            for i in 0..<count {
+                fd.write(LogEntry(level: .info, message: "CONTENT_\(String(format: "%03d", i))_END padding padding"))
+                fd.flush()
+            }
+
+            var recovered = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            let found = archives(in: dir, baseName: "content.log")
+            #expect(!found.isEmpty)
+            for archive in found {
+                #expect(archive.pathExtension == "gz")
+                let data = try gunzip(archive)
+                recovered += String(decoding: data, as: UTF8.self)
+            }
+
+            for i in 0..<count {
+                #expect(
+                    recovered.contains("CONTENT_\(String(format: "%03d", i))_END"),
+                    "entry \(i) missing from current file plus archives"
+                )
+            }
         }
 
         @Test func gzipHandlesEmptyAndTinyInput() throws {

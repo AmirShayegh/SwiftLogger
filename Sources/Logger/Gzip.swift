@@ -80,7 +80,20 @@ internal enum Gzip {
         var totalRead = 0
 
         while true {
-            let chunk = (try? input.read(upToCount: chunkSize)) ?? Data()
+            // A read error must NOT be treated as end-of-input. Doing so would
+            // finalize the stream over a partial file, write a CRC and length
+            // matching what was read, and return success — producing a .gz that
+            // gunzip happily verifies while the caller deletes the complete
+            // original. Silent truncation is far worse than a failed rotation.
+            //
+            // `read(upToCount:)` returns nil at EOF and throws on error, so the
+            // two must be distinguished rather than collapsed with `try?`.
+            let chunk: Data
+            do {
+                chunk = try input.read(upToCount: chunkSize) ?? Data()
+            } catch {
+                return false
+            }
             let isLast = chunk.isEmpty
             totalRead += chunk.count
             crc = crc32Update(crc, chunk)

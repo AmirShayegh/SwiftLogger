@@ -67,12 +67,42 @@ public final class Logger: @unchecked Sendable {
     /// Applies a configuration change. The new snapshot is built outside
     /// `configLock` — constructing a `FileDestination` opens a file handle, which
     /// is far too slow to do while readers are blocked.
-    private func mutateConfig(_ transform: (LoggerConfiguration) -> LoggerConfiguration) {
+    ///
+    /// A transform that drops a destination appends it to `retiring` instead of
+    /// flushing it itself. Retired destinations are flushed, and the outgoing
+    /// snapshot released, only after `writeLock` is dropped — both steps run
+    /// arbitrary user code, and running it under the lock deadlocks:
+    ///
+    /// - `flush()` on a file destination is a `queue.sync`, and the drain
+    ///   renders any pending drop notice through the user's `LogFormatter`.
+    /// - Releasing the last reference to a file destination runs its `deinit`,
+    ///   which drains through that same formatter.
+    ///
+    /// Either one is free to call straight back into a configuration API, and
+    /// `writeLock` is a plain `NSLock`.
+    private func mutateConfig(
+        _ transform: (LoggerConfiguration, inout [any LogDestination]) -> LoggerConfiguration
+    ) {
+        var retiring: [any LogDestination] = []
+
         writeLock.lock()
-        defer { writeLock.unlock() }
         let current = configLock.withLock { _config }
-        let next = transform(current)
+        let next = transform(current, &retiring)
         configLock.withLock { _config = next }
+        writeLock.unlock()
+
+        for destination in retiring {
+            destination.flush()
+        }
+        // `current` holds the last reference to every retired destination, and
+        // ARC is free to release a local at its final use — which would be
+        // inside the critical section above. Pin it until here.
+        withExtendedLifetime(current) {}
+    }
+
+    /// Convenience for transforms that retire nothing.
+    private func mutateConfig(_ transform: (LoggerConfiguration) -> LoggerConfiguration) {
+        mutateConfig { current, _ in transform(current) }
     }
 
     private var consoleDestination: ConsoleDestination? {
@@ -138,7 +168,7 @@ public final class Logger: @unchecked Sendable {
     @discardableResult
     public func fileLogging(_ enabled: Bool) -> Logger {
         var openFailed = false
-        mutateConfig { current in
+        mutateConfig { current, retiring in
             if enabled {
                 guard current.destination(labelled: Self.defaultFileLabel) == nil else { return current }
                 guard let fd = FileDestination() else {
@@ -147,11 +177,12 @@ public final class Logger: @unchecked Sendable {
                 }
                 return current.with(destinations: current.destinations + [fd])
             } else {
-                // Drain synchronously before dropping the reference, so callers
-                // find every entry on disk when this returns rather than racing
-                // the deinit drain. Safe under writeLock: the file queue never
-                // takes writeLock or configLock.
-                current.destination(labelled: Self.defaultFileLabel)?.flush()
+                // Retired rather than dropped, so it is drained synchronously
+                // once the lock is clear: callers find every entry on disk when
+                // this returns rather than racing the deinit drain.
+                if let outgoing = current.destination(labelled: Self.defaultFileLabel) {
+                    retiring.append(outgoing)
+                }
                 return current.with(
                     destinations: current.destinations.filter { $0.label != Self.defaultFileLabel }
                 )
@@ -173,13 +204,14 @@ public final class Logger: @unchecked Sendable {
         formatter: any LogFormatter = DefaultLogFormatter()
     ) -> Logger {
         var openFailed = false
-        mutateConfig { current in
-            // Drain the outgoing destination before its successor opens the
-            // file: its buffered entries must land ahead of the replacement's.
-            // Safe under writeLock — the file queue never takes writeLock or
-            // configLock. A log call that raced into the old snapshot after
-            // this flush still cannot corrupt the file: both handles append.
-            current.destination(labelled: label)?.flush()
+        mutateConfig { current, retiring in
+            // The outgoing destination is drained as soon as the lock is clear,
+            // before this call returns, so its buffered entries land ahead of
+            // the replacement's. A log call that raced into the old snapshot
+            // still cannot corrupt the file: both handles append.
+            if let outgoing = current.destination(labelled: label) {
+                retiring.append(outgoing)
+            }
             guard let fd = FileDestination(
                 url: url,
                 label: label,
@@ -304,11 +336,12 @@ public final class Logger: @unchecked Sendable {
     /// If a destination with the same `label` already exists, it is replaced.
     @discardableResult
     public func addDestination(_ destination: any LogDestination) -> Logger {
-        mutateConfig { current in
+        mutateConfig { current, retiring in
             // Drain any replaced destination so its buffered entries are on
-            // disk before the newcomer starts writing. Safe under writeLock —
-            // destination flushes never take writeLock or configLock.
-            current.destination(labelled: destination.label)?.flush()
+            // disk before the newcomer starts writing.
+            if let outgoing = current.destination(labelled: destination.label) {
+                retiring.append(outgoing)
+            }
             return current.with(
                 destinations: current.destinations.filter { $0.label != destination.label } + [destination]
             )
@@ -320,8 +353,10 @@ public final class Logger: @unchecked Sendable {
     /// before this returns.
     @discardableResult
     public func removeDestination(label: String) -> Logger {
-        mutateConfig { current in
-            current.destination(labelled: label)?.flush()
+        mutateConfig { current, retiring in
+            if let outgoing = current.destination(labelled: label) {
+                retiring.append(outgoing)
+            }
             return current.with(destinations: current.destinations.filter { $0.label != label })
         }
         return self
@@ -531,17 +566,19 @@ public final class Logger: @unchecked Sendable {
 
     internal func reset() {
         writeLock.lock()
-        // Drain outgoing destinations before discarding them (outside
-        // configLock, like every mutateConfig transform) so tests observe
-        // their output deterministically.
-        for destination in configLock.withLock({ _config }).destinations {
-            destination.flush()
-        }
+        let outgoing = configLock.withLock { _config }
         configLock.withLock { _config = .makeDefault() }
         _exceptionHandlerInstalled = false
         _previousExceptionHandler = nil
         exceptionHandlerRegistrar = Self.defaultRegistrar
         writeLock.unlock()
+
+        // Drain and release outside the lock, for the same reason mutateConfig
+        // does: both run the user's formatter, which may reconfigure the logger.
+        for destination in outgoing.destinations {
+            destination.flush()
+        }
+        withExtendedLifetime(outgoing) {}
     }
 }
 
