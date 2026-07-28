@@ -8,10 +8,30 @@ public struct FileRotationConfig: Sendable {
     public var maxFileSize: UInt64
     /// Maximum number of archived log files to keep. 0 means no archives retained. Default: 5.
     public var maxArchivedFilesCount: Int
+    /// How old the current file may get before it is rotated regardless of size.
+    /// `nil` (the default) rotates on size alone.
+    ///
+    /// Age is measured from the file's creation date, so it survives process
+    /// restarts. Like `maxFileSize` this is checked after a write, so a file
+    /// only rotates once something is actually logged past the deadline — an
+    /// idle app does not roll its log over.
+    public var maxFileAge: TimeInterval?
+    /// Whether to gzip archives as they are rotated out. Default: `false`.
+    ///
+    /// Compressed archives get a `.gz` suffix. Log text typically compresses by
+    /// around 10:1, so this trades a little CPU at rotation for a lot of disk.
+    public var compressArchives: Bool
 
-    public init(maxFileSize: UInt64 = 10_485_760, maxArchivedFilesCount: Int = 5) {
+    public init(
+        maxFileSize: UInt64 = 10_485_760,
+        maxArchivedFilesCount: Int = 5,
+        maxFileAge: TimeInterval? = nil,
+        compressArchives: Bool = false
+    ) {
         self.maxFileSize = maxFileSize
         self.maxArchivedFilesCount = max(0, maxArchivedFilesCount)
+        self.maxFileAge = maxFileAge.map { max(0, $0) }
+        self.compressArchives = compressArchives
     }
 }
 
@@ -33,6 +53,9 @@ public final class FileDestination: @unchecked Sendable {
 
     private var fileHandle: FileHandle
     private var currentFileSize: UInt64
+    /// When the current log file came into being, for age-based rotation. Read
+    /// from the file on open so it survives a process restart.
+    private var currentFileStart: Date
 
     // MARK: - Buffer state (guarded by `stateLock`)
 
@@ -87,6 +110,7 @@ public final class FileDestination: @unchecked Sendable {
 
         self.fileHandle = handle
         self.currentFileSize = handle.seekToEndOfFile()
+        self.currentFileStart = Self.creationDate(of: url)
         self.queue = DispatchQueue(label: "com.logger.filewriter.\(label)")
         self.queue.setSpecific(key: Self.queueKey, value: true)
 
@@ -252,7 +276,9 @@ public final class FileDestination: @unchecked Sendable {
 
     private func rotateIfNeeded() {
         guard let config = rotationConfig else { return }
-        guard currentFileSize >= config.maxFileSize else { return }
+        let tooBig = currentFileSize >= config.maxFileSize
+        let tooOld = config.maxFileAge.map { Date().timeIntervalSince(currentFileStart) >= $0 } ?? false
+        guard tooBig || tooOld else { return }
 
         try? fileHandle.synchronize()
         try? fileHandle.close()
@@ -271,15 +297,42 @@ public final class FileDestination: @unchecked Sendable {
             return
         }
 
+        if config.compressArchives {
+            compressArchive(at: archiveURL)
+        }
+
         pruneArchives(in: dir, baseName: baseName, max: config.maxArchivedFilesCount)
 
         FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
         if let newHandle = try? FileHandle(forWritingTo: fileURL) {
             self.fileHandle = newHandle
             self.currentFileSize = 0
+            self.currentFileStart = Date()
         } else {
             reopenOrFail()
         }
+    }
+
+    /// Replaces `url` with a gzipped `url.gz`, leaving the original in place if
+    /// compression fails — a bigger archive beats a lost one.
+    private func compressArchive(at url: URL) {
+        #if canImport(Compression)
+        guard let raw = try? Data(contentsOf: url) else { return }
+        guard let gzipped = Gzip.compress(raw) else { return }
+
+        let compressedURL = URL(fileURLWithPath: url.path + ".gz")
+        do {
+            try gzipped.write(to: compressedURL)
+            try FileManager.default.removeItem(at: url)
+        } catch {
+            try? FileManager.default.removeItem(at: compressedURL)
+        }
+        #endif
+    }
+
+    private static func creationDate(of url: URL) -> Date {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes?[.creationDate] as? Date) ?? Date()
     }
 
     private func reopenOrFail() {
@@ -295,9 +348,10 @@ public final class FileDestination: @unchecked Sendable {
 
         if let handle = try? FileHandle(forWritingTo: fileURL) {
             self.fileHandle = handle
-            // Reset the tracked size to the reopened file so rotateIfNeeded stops
-            // re-entering on every write.
+            // Reset the tracked size and age to the reopened file so rotateIfNeeded
+            // stops re-entering on every write.
             self.currentFileSize = handle.seekToEndOfFile()
+            self.currentFileStart = Self.creationDate(of: fileURL)
         } else {
             fputs("[Logger] File rotation failed — could not reopen \(fileURL.path)\n", stderr)
         }
@@ -314,8 +368,9 @@ public final class FileDestination: @unchecked Sendable {
                 let name = url.lastPathComponent
                 guard name.hasPrefix(prefix) else { return false }
                 let suffix = String(name.dropFirst(prefix.count))
-                // Match: YYYYMMDDTHHMMSSZuuid8 pattern (e.g. 20250515T121530Z_a1b2c3d4)
-                return suffix.range(of: #"^\d{8}T\d{6}Z_[a-f0-9]{8}$"#, options: .regularExpression) != nil
+                // Match: YYYYMMDDTHHMMSSZ_uuid8, optionally gzipped
+                // (e.g. 20250515T121530Z_a1b2c3d4 or ….gz)
+                return suffix.range(of: #"^\d{8}T\d{6}Z_[a-f0-9]{8}(\.gz)?$"#, options: .regularExpression) != nil
             }
             // Order newest-first. The name's timestamp has only 1-second resolution, so
             // a burst of rotations within the same second all share a timestamp and the

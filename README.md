@@ -211,7 +211,28 @@ Log.fileLogging(
 )
 ```
 
-`maxFileSize` is a soft post-write threshold -- a file may exceed it by up to one batch (see below). Archives are named with a UTC timestamp and short UUID (e.g. `myapp.log.20250515T121530Z_a1b2c3d4`) and pruned to `maxArchivedFilesCount`. Set `maxArchivedFilesCount` to `0` to retain no archives.
+Rotate daily and gzip the archives:
+
+```swift
+Log.fileLogging(
+    url: logURL,
+    rotation: FileRotationConfig(
+        maxFileSize: 5_000_000,
+        maxArchivedFilesCount: 7,
+        maxFileAge: 86_400,        // roll over once a day
+        compressArchives: true     // archives become .gz
+    )
+)
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `maxFileSize` | 10 MB | Rotate once the file passes this size |
+| `maxArchivedFilesCount` | 5 | Archives to retain; `0` keeps none |
+| `maxFileAge` | `nil` | Rotate once the file is this old, regardless of size |
+| `compressArchives` | `false` | Gzip archives as they roll out |
+
+`maxFileSize` is a soft post-write threshold -- a file may exceed it by up to one batch (see below). Both triggers are checked after a write, so an idle app never rotates; age is measured from the file's creation date, so it survives process restarts. Archives are named with a UTC timestamp and short UUID (e.g. `myapp.log.20250515T121530Z_a1b2c3d4`, plus `.gz` when compressed), and pruned to `maxArchivedFilesCount`. Compressed archives are standard gzip -- readable by `gunzip`, `zcat`, and anything else.
 
 The file handle is kept open for the lifetime of the destination -- no open/close overhead per write.
 
