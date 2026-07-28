@@ -51,11 +51,23 @@ public final class FileDestination: @unchecked Sendable {
     // `fileHandle`, `currentFileSize`, and everything rotation touches are read
     // and written exclusively on `queue`, so they need no lock.
 
-    private var fileHandle: FileHandle
+    /// The open log file, or `nil` when the destination is *degraded* — it has
+    /// no usable handle and is retrying the open on a backoff. Entries keep
+    /// cycling through the buffer while degraded and are counted as dropped.
+    private var fileHandle: FileHandle?
+    /// The raw descriptor behind `fileHandle`, tracked separately because
+    /// `FileHandle.fileDescriptor` raises an uncatchable Objective-C exception
+    /// once the handle is closed. `-1` means there is nothing to check.
+    private var fileDescriptor: Int32 = -1
     private var currentFileSize: UInt64
     /// When the current log file came into being, for age-based rotation. Read
     /// from the file on open so it survives a process restart.
     private var currentFileStart: Date
+    /// When the last open was attempted, so a persistently failing reopen backs
+    /// off instead of hammering the filesystem on every flush.
+    private var lastReopenAttempt = Date.distantPast
+    /// Successful writes since the handle was last checked for liveness.
+    private var flushesSinceHealthCheck = 0
 
     // MARK: - Buffer state (guarded by `stateLock`)
 
@@ -146,14 +158,15 @@ public final class FileDestination: @unchecked Sendable {
 
         let dir = url.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        guard let handle = Self.openForAppending(at: url) else {
+        guard let opened = Self.openForAppending(at: url) else {
             return nil
         }
 
-        self.fileHandle = handle
+        self.fileHandle = opened.handle
+        self.fileDescriptor = opened.descriptor
         // Size tracking only — with O_APPEND the kernel decides the write
         // position at each write, not this offset.
-        self.currentFileSize = handle.seekToEndOfFile()
+        self.currentFileSize = opened.handle.seekToEndOfFile()
         self.currentFileStart = Self.creationDate(of: url)
         self.queue = DispatchQueue(label: "com.logger.filewriter.\(label)")
         self.queue.setSpecific(key: Self.queueKey, value: true)
@@ -169,10 +182,10 @@ public final class FileDestination: @unchecked Sendable {
     /// own stale offset and silently overwrite bytes. A bonus after rotation:
     /// a stale predecessor's descriptor follows the moved inode, so its late
     /// drain appends to the archive instead of corrupting the fresh file.
-    private static func openForAppending(at url: URL) -> FileHandle? {
+    private static func openForAppending(at url: URL) -> (handle: FileHandle, descriptor: Int32)? {
         let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o644)
         guard fd >= 0 else { return nil }
-        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        return (FileHandle(fileDescriptor: fd, closeOnDealloc: true), fd)
     }
 
     /// Deprecated spelling of ``init(url:label:minimumLevel:rotation:formatter:)``.
@@ -236,6 +249,7 @@ public final class FileDestination: @unchecked Sendable {
         }
 
         queue.async {
+            guard let handle else { return }
             if !remaining.isEmpty {
                 // Last chance: the destination is going away, so a write
                 // failure here has no counter left to report into. try? is
@@ -255,18 +269,21 @@ public final class FileDestination: @unchecked Sendable {
             // Drain anything buffered first so the crash log lands after the
             // entries that led up to it rather than jumping ahead of them.
             self.performFlush()
-            do {
-                try self.fileHandle.write(contentsOf: data)
+            // Crash path: there is no later flush to defer to, so a degraded
+            // destination reopens immediately rather than waiting out the
+            // backoff, and a failed write retries once through a fresh handle.
+            if self.fileHandle == nil {
+                self.attemptReopen()
+            }
+            if (try? self.fileHandle?.write(contentsOf: data)) != nil {
                 self.currentFileSize += UInt64(data.count)
-            } catch {
-                // Crash path: there is no later flush to defer to, so retry
-                // once through a fresh handle immediately.
-                self.reopenOrFail()
-                if (try? self.fileHandle.write(contentsOf: data)) != nil {
+            } else {
+                self.attemptReopen()
+                if (try? self.fileHandle?.write(contentsOf: data)) != nil {
                     self.currentFileSize += UInt64(data.count)
                 }
             }
-            try? self.fileHandle.synchronize()
+            try? self.fileHandle?.synchronize()
         }
         if DispatchQueue.getSpecific(key: Self.queueKey) == true {
             work()
@@ -365,9 +382,17 @@ public final class FileDestination: @unchecked Sendable {
             payload.append(droppedNoticeData(count: dropped))
         }
 
+        guard let handle = liveHandle() else {
+            // Still degraded. The bytes are lost but counted, and the buffer
+            // keeps cycling so the cap semantics hold rather than wedging.
+            recordWriteFailure(batchCount + dropped)
+            return
+        }
+
         do {
-            try fileHandle.write(contentsOf: payload)
+            try handle.write(contentsOf: payload)
             currentFileSize += UInt64(payload.count)
+            checkHandleHealthPeriodically()
             rotateIfNeeded()
         } catch {
             // The bytes are gone — count them as dropped so the next
@@ -376,7 +401,86 @@ public final class FileDestination: @unchecked Sendable {
             // minutes) would rewrite the buffer head on every retry for the
             // same net loss.
             recordWriteFailure(batchCount + dropped)
+            // A failed write usually means the descriptor died rather than the
+            // disk filling for one batch. ENOSPC leaves the handle linked, so
+            // this keeps it; a revoked descriptor gets replaced.
+            invalidateHandleIfUnlinked()
         }
+    }
+
+    // MARK: - Handle liveness (runs exclusively on serial queue)
+
+    /// The handle to write through, reopening a degraded destination once the
+    /// backoff has elapsed. `nil` means still degraded.
+    private func liveHandle() -> FileHandle? {
+        if let handle = fileHandle { return handle }
+        guard Date().timeIntervalSince(lastReopenAttempt) >= reopenBackoff else { return nil }
+        attemptReopen()
+        return fileHandle
+    }
+
+    /// Opens a fresh handle for `fileURL`, replacing whatever is there. On
+    /// failure the destination goes degraded.
+    private func attemptReopen() {
+        lastReopenAttempt = Date()
+        closeCurrentHandle()
+
+        let dir = fileURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        guard let opened = Self.openForAppending(at: fileURL) else {
+            // Reset the rotation counters even though nothing was opened. This
+            // is what stops a failed reopen from churning: leaving
+            // currentFileSize above maxFileSize makes every subsequent write
+            // re-enter rotation, which archives the file again and again until
+            // pruneArchives has eaten every real archive.
+            currentFileSize = 0
+            currentFileStart = Date()
+            flushesSinceHealthCheck = 0
+            fputs("[Logger] could not open \(fileURL.path) — file logging degraded\n", stderr)
+            return
+        }
+
+        fileHandle = opened.handle
+        fileDescriptor = opened.descriptor
+        // A file this call just created starts empty and new, so it can never
+        // be immediately archived by the rotation check.
+        currentFileSize = opened.handle.seekToEndOfFile()
+        currentFileStart = Self.creationDate(of: fileURL)
+        flushesSinceHealthCheck = 0
+    }
+
+    private func closeCurrentHandle() {
+        if let stale = fileHandle {
+            try? stale.close()
+        }
+        fileHandle = nil
+        fileDescriptor = -1
+    }
+
+    /// Periodically confirms the open descriptor still refers to a file anyone
+    /// can read.
+    ///
+    /// Writes to an unlinked inode succeed forever and land nowhere — no error
+    /// surfaces, so without this check an externally deleted log file means
+    /// silent loss for the rest of the process's life. `st_nlink == 0` catches
+    /// both a plain delete and the delete-then-recreate that a path-existence
+    /// check would miss. One `fstat` every `healthCheckStride` writes is
+    /// sub-microsecond and independent of whether rotation is configured.
+    private func checkHandleHealthPeriodically() {
+        flushesSinceHealthCheck += 1
+        guard flushesSinceHealthCheck >= healthCheckStride else { return }
+        flushesSinceHealthCheck = 0
+        invalidateHandleIfUnlinked()
+    }
+
+    /// Drops and reopens the handle if its descriptor no longer refers to a
+    /// linked file. Leaves a healthy handle untouched.
+    private func invalidateHandleIfUnlinked() {
+        guard fileDescriptor >= 0 else { return }
+        var info = stat()
+        if fstat(fileDescriptor, &info) == 0 && info.st_nlink > 0 { return }
+        attemptReopen()
     }
 
     /// Folds a failed write's entries into the dropped count so the next
@@ -392,20 +496,27 @@ public final class FileDestination: @unchecked Sendable {
     /// descriptor (revoked file, ENOSPC-style outage) without needing one.
     internal func closeHandleForTesting() {
         queue.sync {
-            try? fileHandle.close()
+            try? fileHandle?.close()
         }
+    }
+
+    /// Whether the destination currently holds a usable file handle.
+    internal var isHealthyForTesting: Bool {
+        queue.sync { fileHandle != nil }
     }
 
     // MARK: - Rotation (runs exclusively on serial queue)
 
     private func rotateIfNeeded() {
-        guard let config = rotationConfig else { return }
+        // A degraded destination has nothing to archive, and its counters were
+        // reset on the way down so neither trigger can fire spuriously.
+        guard let handle = fileHandle, let config = rotationConfig else { return }
         let tooBig = currentFileSize >= config.maxFileSize
         let tooOld = config.maxFileAge.map { Date().timeIntervalSince(currentFileStart) >= $0 } ?? false
         guard tooBig || tooOld else { return }
 
-        try? fileHandle.synchronize()
-        try? fileHandle.close()
+        try? handle.synchronize()
+        closeCurrentHandle()
 
         let baseName = fileURL.lastPathComponent
         let dir = fileURL.deletingLastPathComponent()
@@ -417,7 +528,7 @@ public final class FileDestination: @unchecked Sendable {
         do {
             try FileManager.default.moveItem(at: fileURL, to: archiveURL)
         } catch {
-            reopenOrFail()
+            attemptReopen()
             return
         }
 
@@ -427,13 +538,7 @@ public final class FileDestination: @unchecked Sendable {
 
         pruneArchives(in: dir, baseName: baseName, max: config.maxArchivedFilesCount)
 
-        if let newHandle = Self.openForAppending(at: fileURL) {
-            self.fileHandle = newHandle
-            self.currentFileSize = 0
-            self.currentFileStart = Date()
-        } else {
-            reopenOrFail()
-        }
+        attemptReopen()
     }
 
     /// Replaces `url` with a gzipped `url.gz`, leaving the original in place if
@@ -456,25 +561,6 @@ public final class FileDestination: @unchecked Sendable {
     private static func creationDate(of url: URL) -> Date {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         return (attributes?[.creationDate] as? Date) ?? Date()
-    }
-
-    private func reopenOrFail() {
-        // O_CREAT recreates the log file if it vanished (deleted externally, or
-        // a rotation moveItem consumed it but the fresh open failed); only the
-        // directory needs recreating by hand. Without this, every subsequent
-        // write would be silently dropped for the process lifetime.
-        let dir = fileURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-
-        if let handle = Self.openForAppending(at: fileURL) {
-            self.fileHandle = handle
-            // Reset the tracked size and age to the reopened file so rotateIfNeeded
-            // stops re-entering on every write.
-            self.currentFileSize = handle.seekToEndOfFile()
-            self.currentFileStart = Self.creationDate(of: fileURL)
-        } else {
-            fputs("[Logger] File rotation failed — could not reopen \(fileURL.path)\n", stderr)
-        }
     }
 
     private func pruneArchives(in dir: URL, baseName: String, max: Int) {
@@ -545,7 +631,7 @@ extension FileDestination: LogDestination {
 
         let work = { [self] in
             self.performFlush()
-            try? self.fileHandle.synchronize()
+            try? self.fileHandle?.synchronize()
         }
         // Same reasoning as `forceSave`: `queue.sync` from the queue's own thread
         // would trap, so run inline when we are already on it.

@@ -254,6 +254,126 @@ extension AllLoggerTests {
             #expect(allContent.contains("POSTDEL_"))
         }
 
+        @Test func externalDeletionWithoutRotationConfigRecovers() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let logURL = dir.appendingPathComponent("nodrot.log")
+
+            // No rotation configured: nothing ever calls moveItem, so the old
+            // recovery path (which only ran from rotation) never fired. Writes
+            // to the unlinked inode succeeded forever and landed nowhere.
+            // healthCheckStride: 1 checks after every flush so the test does
+            // not depend on batching cadence.
+            let fd = FileDestination(
+                url: logURL,
+                tunables: .init(reopenBackoff: 0, healthCheckStride: 1)
+            )!
+
+            fd.write(LogEntry(level: .info, message: "before deletion"))
+            fd.flush()
+            #expect(try String(contentsOf: logURL, encoding: .utf8).contains("before deletion"))
+
+            try FileManager.default.removeItem(at: logURL)
+
+            // First write after the delete lands in the unlinked inode and is
+            // lost; the health check that follows it notices st_nlink == 0 and
+            // reopens, so subsequent entries reach a readable file.
+            fd.write(LogEntry(level: .info, message: "first after deletion"))
+            fd.flush()
+            fd.write(LogEntry(level: .info, message: "AFTER_RECOVERY"))
+            fd.flush()
+
+            #expect(FileManager.default.fileExists(atPath: logURL.path))
+            #expect(try String(contentsOf: logURL, encoding: .utf8).contains("AFTER_RECOVERY"))
+        }
+
+        @Test func deleteAndRecreateIsDetectedByLinkCount() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let logURL = dir.appendingPathComponent("recreated.log")
+
+            let fd = FileDestination(
+                url: logURL,
+                tunables: .init(reopenBackoff: 0, healthCheckStride: 1)
+            )!
+            fd.write(LogEntry(level: .info, message: "original inode"))
+            fd.flush()
+
+            // Delete *and recreate* at the same path — the case a plain
+            // fileExists check cannot see, because the path is occupied again
+            // while our descriptor still points at the orphaned inode.
+            try FileManager.default.removeItem(at: logURL)
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+
+            fd.write(LogEntry(level: .info, message: "lost to the orphan"))
+            fd.flush()
+            fd.write(LogEntry(level: .info, message: "REACHES_NEW_INODE"))
+            fd.flush()
+
+            #expect(try String(contentsOf: logURL, encoding: .utf8).contains("REACHES_NEW_INODE"))
+        }
+
+        @Test func failedReopenBacksOffWithoutChurningArchives() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let logDir = dir.appendingPathComponent("logs")
+            try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+            let logURL = logDir.appendingPathComponent("churn.log")
+
+            let fd = FileDestination(
+                url: logURL,
+                rotation: FileRotationConfig(maxFileSize: 80, maxArchivedFilesCount: 5),
+                tunables: .init(reopenBackoff: 0.05, healthCheckStride: 1)
+            )!
+
+            for i in 0..<10 {
+                fd.write(LogEntry(level: .info, message: "healthy entry \(i) with padding"))
+                fd.flush()
+            }
+            let archivesBefore = archives(in: logDir, baseName: "churn.log")
+            #expect(!archivesBefore.isEmpty)
+
+            // Replace the log *file* with a directory: open(O_WRONLY) then
+            // fails with EISDIR for as long as it stays that way, while the log
+            // directory and its archives remain on disk to be counted.
+            try FileManager.default.removeItem(at: logURL)
+            try FileManager.default.createDirectory(at: logURL, withIntermediateDirectories: false)
+
+            for i in 0..<40 {
+                fd.write(LogEntry(level: .info, message: "degraded entry \(i) with padding"))
+                fd.flush()
+            }
+
+            #expect(!fd.isHealthyForTesting)
+
+            // The point of the test: resetting the size and age counters on the
+            // way down kept rotation from re-entering. Pre-fix currentFileSize
+            // stayed above maxFileSize, so every write archived the missing
+            // file again until pruning had eaten every real archive.
+            let archivesDuring = archives(in: logDir, baseName: "churn.log")
+            #expect(archivesDuring.map(\.lastPathComponent) == archivesBefore.map(\.lastPathComponent))
+
+            // Restore the path; the destination must come back on its own.
+            try FileManager.default.removeItem(at: logURL)
+            Thread.sleep(forTimeInterval: 0.1)  // outlast reopenBackoff
+
+            fd.write(LogEntry(level: .info, message: "RECOVERED_ENTRY"))
+            fd.flush()
+
+            #expect(fd.isHealthyForTesting)
+
+            // The recovery batch carries the drop notice for everything lost
+            // while degraded, which is itself enough to trip the 80-byte
+            // rotation threshold — so the entry may be in the current file or
+            // in the archive that write produced.
+            var allContent = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+            for archive in archives(in: logDir, baseName: "churn.log") {
+                allContent += (try? String(contentsOf: archive, encoding: .utf8)) ?? ""
+            }
+            #expect(allContent.contains("RECOVERED_ENTRY"))
+            #expect(allContent.contains("dropped"))
+        }
+
         // Locked probe (bug category: destructive edge case). A fast burst rotates
         // many times within the same wall-clock second, so every archive shares the
         // 1-second-resolution timestamp in its name. Retention must still keep the
