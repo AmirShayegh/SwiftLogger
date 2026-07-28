@@ -256,6 +256,40 @@ extension AllLoggerTests {
             #expect(lines(of: url).count == writers * perWriter)
         }
 
+        @Test func appendModeAllowsTwoHandlesOnOneFileWithoutOverwrite() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("shared.log")
+
+            // Two destinations on one file — the shape a replaced destination's
+            // late drain produces. With per-handle offsets each handle would
+            // write from its own stale position and silently overwrite the
+            // other's bytes; O_APPEND makes the kernel pick end-of-file at
+            // every write, so all lines must survive.
+            let a = FileDestination(
+                url: url, label: "a",
+                tunables: .init(flushInterval: 600, flushByteThreshold: 1_000_000)
+            )!
+            let b = FileDestination(
+                url: url, label: "b",
+                tunables: .init(flushInterval: 600, flushByteThreshold: 1_000_000)
+            )!
+
+            for i in 0..<10 {
+                a.write(LogEntry(level: .info, message: "handle-a \(i)"))
+                a.flush()
+                b.write(LogEntry(level: .info, message: "handle-b \(i)"))
+                b.flush()
+            }
+
+            let written = lines(of: url)
+            #expect(written.count == 20)
+            for i in 0..<10 {
+                #expect(written.contains { $0.contains("handle-a \(i)") })
+                #expect(written.contains { $0.contains("handle-b \(i)") })
+            }
+        }
+
         @Test func rotationThresholdClampsTheBufferSize() throws {
             let dir = try makeTempDir()
             defer { try? FileManager.default.removeItem(at: dir) }

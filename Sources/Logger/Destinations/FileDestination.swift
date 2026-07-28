@@ -144,23 +144,35 @@ public final class FileDestination: @unchecked Sendable {
         self.reopenBackoff = tunables.reopenBackoff
         self.healthCheckStride = tunables.healthCheckStride
 
-        if !FileManager.default.fileExists(atPath: url.path) {
-            let dir = url.deletingLastPathComponent()
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            guard FileManager.default.createFile(atPath: url.path, contents: nil, attributes: nil) else {
-                return nil
-            }
-        }
-
-        guard let handle = try? FileHandle(forWritingTo: url) else {
+        let dir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        guard let handle = Self.openForAppending(at: url) else {
             return nil
         }
 
         self.fileHandle = handle
+        // Size tracking only — with O_APPEND the kernel decides the write
+        // position at each write, not this offset.
         self.currentFileSize = handle.seekToEndOfFile()
         self.currentFileStart = Self.creationDate(of: url)
         self.queue = DispatchQueue(label: "com.logger.filewriter.\(label)")
         self.queue.setSpecific(key: Self.queueKey, value: true)
+    }
+
+    /// Opens `url` for appending, creating the file if needed. Every open in
+    /// this class funnels through here.
+    ///
+    /// `O_APPEND` makes each write land atomically at the file's current end,
+    /// no matter what other handle wrote in between. Without it, a second
+    /// handle on the same file (a replaced destination draining late, two
+    /// destinations sharing a URL, an external writer) would write from its
+    /// own stale offset and silently overwrite bytes. A bonus after rotation:
+    /// a stale predecessor's descriptor follows the moved inode, so its late
+    /// drain appends to the archive instead of corrupting the fresh file.
+    private static func openForAppending(at url: URL) -> FileHandle? {
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o644)
+        guard fd >= 0 else { return nil }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
     /// Deprecated spelling of ``init(url:label:minimumLevel:rotation:formatter:)``.
@@ -365,8 +377,7 @@ public final class FileDestination: @unchecked Sendable {
 
         pruneArchives(in: dir, baseName: baseName, max: config.maxArchivedFilesCount)
 
-        FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
-        if let newHandle = try? FileHandle(forWritingTo: fileURL) {
+        if let newHandle = Self.openForAppending(at: fileURL) {
             self.fileHandle = newHandle
             self.currentFileSize = 0
             self.currentFileStart = Date()
@@ -398,17 +409,14 @@ public final class FileDestination: @unchecked Sendable {
     }
 
     private func reopenOrFail() {
-        // Recreate the log file if it vanished (e.g. deleted externally, or a
-        // rotation moveItem consumed it but the fresh createFile failed). Without
-        // this, FileHandle(forWritingTo:) never creates a missing file and every
-        // subsequent write is silently dropped for the process lifetime.
-        if !FileManager.default.fileExists(atPath: fileURL.path) {
-            let dir = fileURL.deletingLastPathComponent()
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
-        }
+        // O_CREAT recreates the log file if it vanished (deleted externally, or
+        // a rotation moveItem consumed it but the fresh open failed); only the
+        // directory needs recreating by hand. Without this, every subsequent
+        // write would be silently dropped for the process lifetime.
+        let dir = fileURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
-        if let handle = try? FileHandle(forWritingTo: fileURL) {
+        if let handle = Self.openForAppending(at: fileURL) {
             self.fileHandle = handle
             // Reset the tracked size and age to the reopened file so rotateIfNeeded
             // stops re-entering on every write.

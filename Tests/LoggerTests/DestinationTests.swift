@@ -429,5 +429,51 @@ extension AllLoggerTests {
             let content = waitForContent(of: customURL, containing: "custom survives round trip")
             #expect(content.contains("custom survives round trip"))
         }
+
+        // MARK: - Drain on Replace / Remove
+
+        @Test func replacingFileDestinationDrainsItsBuffer() throws {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("logger-test-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            let url = tmp.appendingPathComponent("replace.log")
+
+            Logger.shared.consoleLogging(false)
+            Logger.shared.fileLogging(url: url, label: "replaced")
+            Logger.shared.log("first generation", level: .info)
+
+            // Same label, same URL: the predecessor's buffered entry must be
+            // drained by the replacement — before the successor writes — not
+            // left to race the deinit drain or be overwritten.
+            Logger.shared.fileLogging(url: url, label: "replaced")
+            Logger.shared.log("second generation", level: .info)
+            Logger.shared.flush()
+
+            let content = try String(contentsOf: url, encoding: .utf8)
+            let first = try #require(content.range(of: "first generation"))
+            let second = try #require(content.range(of: "second generation"))
+            #expect(first.lowerBound < second.lowerBound)
+
+            // Each entry exactly once — nothing lost, nothing duplicated.
+            #expect(content.components(separatedBy: "first generation").count == 2)
+            #expect(content.components(separatedBy: "second generation").count == 2)
+        }
+
+        @Test func removingFileDestinationDrainsSynchronously() throws {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("logger-test-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            let url = tmp.appendingPathComponent("removed.log")
+
+            Logger.shared.consoleLogging(false)
+            Logger.shared.fileLogging(url: url, label: "removed")
+            Logger.shared.log("buffered before removal", level: .info)
+            Logger.shared.removeDestination(label: "removed")
+
+            // No polling on purpose: the drain is part of removeDestination's
+            // contract, so the entry must be on disk the moment it returns.
+            let content = try String(contentsOf: url, encoding: .utf8)
+            #expect(content.contains("buffered before removal"))
+        }
     }
 }

@@ -147,6 +147,11 @@ public final class Logger: @unchecked Sendable {
                 }
                 return current.with(destinations: current.destinations + [fd])
             } else {
+                // Drain synchronously before dropping the reference, so callers
+                // find every entry on disk when this returns rather than racing
+                // the deinit drain. Safe under writeLock: the file queue never
+                // takes writeLock or configLock.
+                current.destination(labelled: Self.defaultFileLabel)?.flush()
                 return current.with(
                     destinations: current.destinations.filter { $0.label != Self.defaultFileLabel }
                 )
@@ -169,6 +174,12 @@ public final class Logger: @unchecked Sendable {
     ) -> Logger {
         var openFailed = false
         mutateConfig { current in
+            // Drain the outgoing destination before its successor opens the
+            // file: its buffered entries must land ahead of the replacement's.
+            // Safe under writeLock — the file queue never takes writeLock or
+            // configLock. A log call that raced into the old snapshot after
+            // this flush still cannot corrupt the file: both handles append.
+            current.destination(labelled: label)?.flush()
             guard let fd = FileDestination(
                 url: url,
                 label: label,
@@ -294,18 +305,24 @@ public final class Logger: @unchecked Sendable {
     @discardableResult
     public func addDestination(_ destination: any LogDestination) -> Logger {
         mutateConfig { current in
-            current.with(
+            // Drain any replaced destination so its buffered entries are on
+            // disk before the newcomer starts writing. Safe under writeLock —
+            // destination flushes never take writeLock or configLock.
+            current.destination(labelled: destination.label)?.flush()
+            return current.with(
                 destinations: current.destinations.filter { $0.label != destination.label } + [destination]
             )
         }
         return self
     }
 
-    /// Removes a destination by label.
+    /// Removes a destination by label. Buffered output is drained to storage
+    /// before this returns.
     @discardableResult
     public func removeDestination(label: String) -> Logger {
         mutateConfig { current in
-            current.with(destinations: current.destinations.filter { $0.label != label })
+            current.destination(labelled: label)?.flush()
+            return current.with(destinations: current.destinations.filter { $0.label != label })
         }
         return self
     }
@@ -508,6 +525,12 @@ public final class Logger: @unchecked Sendable {
 
     internal func reset() {
         writeLock.lock()
+        // Drain outgoing destinations before discarding them (outside
+        // configLock, like every mutateConfig transform) so tests observe
+        // their output deterministically.
+        for destination in configLock.withLock({ _config }).destinations {
+            destination.flush()
+        }
         configLock.withLock { _config = .makeDefault() }
         _exceptionHandlerInstalled = false
         _previousExceptionHandler = nil
