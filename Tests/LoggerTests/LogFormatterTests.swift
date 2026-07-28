@@ -229,6 +229,101 @@ extension AllLoggerTests {
             #expect(try String(contentsOf: url, encoding: .utf8) == "<INFO>terse\n")
         }
 
+        // MARK: - JSON escaping
+
+        /// The pre-optimisation escaper, kept here verbatim as an independent
+        /// reference implementation. The fast-path scanner must agree with it
+        /// on every input — that is the whole safety argument for skipping the
+        /// per-scalar walk.
+        private static func legacyQuoted(_ string: String) -> String {
+            var out = "\""
+            for scalar in string.unicodeScalars {
+                switch scalar {
+                case "\"": out += "\\\""
+                case "\\": out += "\\\\"
+                case "\n": out += "\\n"
+                case "\r": out += "\\r"
+                case "\t": out += "\\t"
+                case "\u{08}": out += "\\b"
+                case "\u{0C}": out += "\\f"
+                default:
+                    if scalar.value < 0x20 {
+                        out += String(format: "\\u%04x", scalar.value)
+                    } else {
+                        out.unicodeScalars.append(scalar)
+                    }
+                }
+            }
+            return out + "\""
+        }
+
+        private func quoted(_ string: String) -> String {
+            var out = ""
+            JSONLogFormatter.appendQuoted(string, to: &out)
+            return out
+        }
+
+        @Test func jsonQuotedMatchesLegacyEscaperOnAdversarialTable() {
+            let cases: [String] = [
+                "",
+                "plain",
+                "\"", "\\", "\n", "\r", "\t", "\u{08}", "\u{0C}",
+                "\u{00}", "\u{01}", "\u{07}", "\u{0B}", "\u{0E}", "\u{1F}",
+                "\u{7F}",                       // DEL is NOT escaped by JSON
+                "leading\"quote", "trailing\\", "\nleading-newline", "trailing-newline\n",
+                "mixed \" and \\ and \n together",
+                "héllo wörld", "🌍🌏", "日本語のログ", "e\u{0301}gal",
+                "emoji\u{0}with\u{1}nulls🌍",
+                "line1\r\nline2",
+                String(repeating: "a", count: 200),
+                String(repeating: "\"", count: 20),
+                "\u{1F}\u{1E}\u{1D}\u{1C}",
+                "tab\tin\tthe\tmiddle",
+            ]
+            for input in cases {
+                #expect(quoted(input) == Self.legacyQuoted(input), "diverged on \(input.debugDescription)")
+            }
+        }
+
+        @Test func jsonControlEscapesKeepLowercaseFourDigitForm() {
+            #expect(quoted("\u{01}") == "\"\\u0001\"")
+            #expect(quoted("\u{1F}") == "\"\\u001f\"")
+            #expect(quoted("\u{0B}") == "\"\\u000b\"")
+            #expect(quoted("\u{00}") == "\"\\u0000\"")
+        }
+
+        @Test func jsonFastPathPreservesMultiByteStringsVerbatim() {
+            // Every byte of a multi-byte scalar is >= 0x80, so the byte-level
+            // scan can never mistake one for a control character — these must
+            // take the fast path and come through untouched.
+            #expect(quoted("héllo 🌍 日本語") == "\"héllo 🌍 日本語\"")
+            #expect(quoted("\u{7F}") == "\"\u{7F}\"")
+        }
+
+        @Test func jsonEscapesAtFirstAndLastPosition() {
+            #expect(quoted("\nstart") == "\"\\nstart\"")
+            #expect(quoted("end\n") == "\"end\\n\"")
+            #expect(quoted("\"") == "\"\\\"\"")
+        }
+
+        @Test func jsonEscapedOutputStillParses() throws {
+            let entry = LogEntry(
+                level: .error,
+                message: "he said \"hi\"\nthen \\left\u{01}",
+                metadata: ["key\"with quote": "value\nwith newline"],
+                correlation: "c\t1",
+                subsystem: "sub\\system",
+                fileName: "F.swift",
+                line: 1
+            )
+            let object = try decode(JSONLogFormatter().format(entry))
+            #expect(object["message"] as? String == "he said \"hi\"\nthen \\left\u{01}")
+            #expect(object["correlation"] as? String == "c\t1")
+            #expect(object["subsystem"] as? String == "sub\\system")
+            let metadata = try #require(object["metadata"] as? [String: Any])
+            #expect(metadata["key\"with quote"] as? String == "value\nwith newline")
+        }
+
         // MARK: - Default format, byte for byte
 
         // Characterization pins for the default text line. Every separator,

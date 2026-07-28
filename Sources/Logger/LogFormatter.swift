@@ -50,38 +50,59 @@ public struct JSONLogFormatter: LogFormatter {
     }
 
     public func format(_ entry: LogEntry) -> String {
-        var json = "{"
+        var json = ""
+        // Fixed scaffolding is ~90 bytes; the rest is a close-enough estimate
+        // to avoid growing the buffer mid-render.
+        var capacity = 96 + entry.message.utf8.count
+            + entry.fileName.utf8.count + entry.function.utf8.count
+        if let correlation = entry.correlation { capacity += correlation.utf8.count + 18 }
+        if let subsystem = entry.subsystem { capacity += subsystem.utf8.count + 16 }
+        if let metadata = entry.metadata { capacity += metadata.count * 24 + 14 }
+        json.reserveCapacity(capacity)
 
+        // The fixed keys are written as literals. They contain nothing the
+        // escaper could change, so running them through it every time was pure
+        // overhead — only values and user-supplied metadata keys need it.
+        json += "{\"timestamp\":"
         switch timestampStyle {
         case .iso8601:
-            appendString(&json, key: "timestamp", value: Self.iso8601(entry.timestamp), isFirst: true)
+            Self.appendQuoted(Self.iso8601(entry.timestamp), to: &json)
         case .epochSeconds:
-            json += "\"timestamp\":\(entry.timestamp.timeIntervalSince1970)"
+            json += String(entry.timestamp.timeIntervalSince1970)
         }
 
-        appendString(&json, key: "level", value: entry.level.rawValue)
-        appendString(&json, key: "message", value: entry.message)
+        json += ",\"level\":"
+        Self.appendQuoted(entry.level.rawValue, to: &json)
+        json += ",\"message\":"
+        Self.appendQuoted(entry.message, to: &json)
 
         if let correlation = entry.correlation {
-            appendString(&json, key: "correlation", value: correlation)
+            json += ",\"correlation\":"
+            Self.appendQuoted(correlation, to: &json)
         }
         if let subsystem = entry.subsystem {
-            appendString(&json, key: "subsystem", value: subsystem)
+            json += ",\"subsystem\":"
+            Self.appendQuoted(subsystem, to: &json)
         }
         if !entry.fileName.isEmpty {
-            appendString(&json, key: "file", value: entry.fileName)
+            json += ",\"file\":"
+            Self.appendQuoted(entry.fileName, to: &json)
         }
         if !entry.function.isEmpty {
-            appendString(&json, key: "function", value: entry.function)
+            json += ",\"function\":"
+            Self.appendQuoted(entry.function, to: &json)
         }
-        json += ",\"line\":\(entry.line)"
+        json += ",\"line\":"
+        json += String(entry.line)
 
         if let metadata = entry.metadata, !metadata.isEmpty {
             json += ",\"metadata\":{"
             var first = true
             for key in metadata.keys.sorted() {
                 if !first { json += "," }
-                json += "\(Self.quoted(key)):\(Self.jsonValue(metadata[key]!))"
+                Self.appendQuoted(key, to: &json)
+                json += ":"
+                Self.appendValue(metadata[key]!, to: &json)
                 first = false
             }
             json += "}"
@@ -91,29 +112,38 @@ public struct JSONLogFormatter: LogFormatter {
         return json
     }
 
-    private func appendString(_ json: inout String, key: String, value: String, isFirst: Bool = false) {
-        if !isFirst { json += "," }
-        json += "\(Self.quoted(key)):\(Self.quoted(value))"
-    }
-
-    private static func jsonValue(_ value: LogValue) -> String {
+    private static func appendValue(_ value: LogValue, to out: inout String) {
         switch value {
-        case .string(let s): return quoted(s)
-        case .int(let i): return String(i)
-        case .bool(let b): return b ? "true" : "false"
+        case .string(let s): appendQuoted(s, to: &out)
+        case .int(let i): out += String(i)
+        case .bool(let b): out += b ? "true" : "false"
         case .double(let d):
             // JSON has no representation for these, so fall back to a string
             // rather than emitting something no parser will accept.
-            guard d.isFinite else { return quoted(String(d)) }
-            return String(d)
+            if d.isFinite { out += String(d) } else { appendQuoted(String(d), to: &out) }
         }
     }
 
-    /// Escapes per RFC 8259: the two mandatory escapes, the shorthand control
+    /// Appends `string` as a quoted JSON string, escaped per RFC 8259.
+    ///
+    /// Almost every string a logger sees contains nothing to escape, so it is
+    /// scanned first and appended whole in that case. The scan works on UTF-8
+    /// bytes, which is safe for non-ASCII text: every byte of a multi-byte
+    /// scalar is >= 0x80, so no continuation byte can be mistaken for a quote,
+    /// a backslash, or a control character.
+    internal static func appendQuoted(_ string: String, to out: inout String) {
+        out += "\""
+        if string.utf8.contains(where: { $0 < 0x20 || $0 == 0x22 || $0 == 0x5C }) {
+            appendEscaped(string, to: &out)
+        } else {
+            out += string
+        }
+        out += "\""
+    }
+
+    /// The cold path: the two mandatory escapes, the shorthand control
     /// characters, and `\u00XX` for the rest of C0.
-    private static func quoted(_ string: String) -> String {
-        var out = "\""
-        out.reserveCapacity(string.utf8.count + 2)
+    private static func appendEscaped(_ string: String, to out: inout String) {
         for scalar in string.unicodeScalars {
             switch scalar {
             case "\"": out += "\\\""
@@ -125,13 +155,24 @@ public struct JSONLogFormatter: LogFormatter {
             case "\u{0C}": out += "\\f"
             default:
                 if scalar.value < 0x20 {
-                    out += String(format: "\\u%04x", scalar.value)
+                    // Everything reaching here is < 0x20, so the escape is
+                    // always \u00 followed by two hex digits — no need for the
+                    // general-purpose (and far slower) String(format:).
+                    let byte = UInt8(scalar.value)
+                    out += "\\u00"
+                    out.unicodeScalars.append(hexDigit(byte >> 4))
+                    out.unicodeScalars.append(hexDigit(byte & 0xF))
                 } else {
                     out.unicodeScalars.append(scalar)
                 }
             }
         }
-        return out + "\""
+    }
+
+    /// Lowercase hex, matching what `String(format: "%04x")` produced.
+    @inline(__always)
+    private static func hexDigit(_ nibble: UInt8) -> Unicode.Scalar {
+        Unicode.Scalar(nibble < 10 ? 0x30 + nibble : 0x61 + (nibble - 10))
     }
 
     // One shared formatter behind a lock. Allocating an ISO8601DateFormatter per
