@@ -493,6 +493,73 @@ struct AllLoggerTests {
             }
         }
 
+        /// Readers work against an immutable configuration snapshot, so a config
+        /// change mid-flight means a message observes either the old or the new
+        /// configuration — never a torn mix, and never a lost message when every
+        /// level in play passes both. Best run under `--sanitize=thread`.
+        @Test func loggingDeliversEveryMessageWhileConfigurationMutates() async {
+            Logger.shared.consoleLogging(false)
+            Logger.shared.minimumLevel(.verbose)
+
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+
+            let taskCount = 4
+            let messagesPerTask = 500
+
+            await withTaskGroup(of: Void.self) { group in
+                for taskIndex in 0..<taskCount {
+                    group.addTask {
+                        for i in 0..<messagesPerTask {
+                            Logger.shared.log(
+                                "task \(taskIndex) message \(i)",
+                                level: .error,
+                                subsystem: "stress.task\(taskIndex)"
+                            )
+                        }
+                    }
+                }
+
+                // Churn every field of the snapshot underneath the loggers. All
+                // minimums cycled through are at or below .error, so no message
+                // above may be dropped regardless of which snapshot it observes.
+                group.addTask {
+                    for i in 0..<200 {
+                        Logger.shared.minimumLevel(i.isMultiple(of: 2) ? .verbose : .debug)
+                        Logger.shared.subsystem("stress", level: .verbose)
+                        Logger.shared.logLevel(.verbose, forFile: "LoggerTests.swift")
+                        Logger.shared.resetLogLevel(forFile: "LoggerTests.swift")
+                        Logger.shared.resetSubsystem("stress")
+                    }
+                }
+            }
+
+            #expect(mock.entries.count == taskCount * messagesPerTask)
+        }
+
+        /// Destination registration is a read-modify-write over the destination
+        /// list; without end-to-end serialization of mutations, concurrent
+        /// registrations would clobber each other.
+        @Test func concurrentDestinationRegistrationDoesNotLoseUpdates() async {
+            Logger.shared.consoleLogging(false)
+
+            await withTaskGroup(of: Void.self) { group in
+                for i in 0..<32 {
+                    group.addTask {
+                        Logger.shared.addDestination(MockDestination(label: "concurrent-\(i)"))
+                    }
+                }
+            }
+
+            Logger.shared.log("fan out", level: .error)
+
+            let delivered = (0..<32).filter { i in
+                let dest = Logger.shared.destinationForTesting(label: "concurrent-\(i)") as? MockDestination
+                return dest?.entries.count == 1
+            }.count
+            #expect(delivered == 32)
+        }
+
         @Test func concurrentConfigurationDoesNotCrash() async {
             Logger.shared.consoleLogging(false)
 

@@ -21,18 +21,23 @@ import Foundation
 ///     // Log anywhere
 ///     Log("request sent", level: .debug, subsystem: "network")
 ///
-/// All mutable state is protected by an internal lock. The class is marked
-/// `@unchecked Sendable` because every stored property is either immutable
-/// or accessed exclusively under that lock.
+/// Configuration is held as an immutable snapshot swapped under a lock, so the
+/// logging path reads it with a single reference load rather than locking each
+/// field. The class is marked `@unchecked Sendable` because every stored
+/// property is either immutable or accessed exclusively under a lock.
 public final class Logger: @unchecked Sendable {
     public static let shared = Logger()
 
-    private let lock = NSLock()
+    /// Guards only the `_config` reference — held just long enough to load or
+    /// store a pointer, never across destination work.
+    private let configLock = UnfairLock()
+    private var _config: LoggerConfiguration
 
-    private var _minimumLogLevel: LogLevel = .debug
-    private var _fileLogLevels: [String: LogLevel] = [:]
-    private var _subsystemLevels: [String: LogLevel] = [:]
-    private var _destinations: [any LogDestination] = []
+    /// Serializes configuration *mutations* end-to-end, so concurrent
+    /// read-modify-write sequences cannot lose updates. Also guards the
+    /// exception-handler fields, which are cold-path only.
+    private let writeLock = NSLock()
+
     private var _exceptionHandlerInstalled = false
     private var _previousExceptionHandler: (@convention(c) (NSException) -> Void)?
 
@@ -42,26 +47,40 @@ public final class Logger: @unchecked Sendable {
     internal var exceptionHandlerRegistrar: (@convention(c) (NSException) -> Void) -> Void = Logger.defaultRegistrar
 
     private init() {
-        _destinations = [ConsoleDestination()]
+        _config = .makeDefault()
     }
 
-    // MARK: - Destination Access (internal)
+    // MARK: - Configuration Access
 
     /// Label identifying the default file destination managed by ``fileLogging(_:)``.
     /// Matches the default label of ``fileLogging(url:label:minimumLevel:rotation:)``
     /// and the internal `FileDestination` convenience initializer.
     private static let defaultFileLabel = "file"
 
-    private func destination<T: LogDestination>(ofType type: T.Type) -> T? {
-        _destinations.first(where: { $0 is T }) as? T
+    /// Label identifying the console destination.
+    private static let consoleLabel = "console"
+
+    private var config: LoggerConfiguration {
+        configLock.withLock { _config }
+    }
+
+    /// Applies a configuration change. The new snapshot is built outside
+    /// `configLock` — constructing a `FileDestination` opens a file handle, which
+    /// is far too slow to do while readers are blocked.
+    private func mutateConfig(_ transform: (LoggerConfiguration) -> LoggerConfiguration) {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        let current = configLock.withLock { _config }
+        let next = transform(current)
+        configLock.withLock { _config = next }
     }
 
     private var consoleDestination: ConsoleDestination? {
-        destination(ofType: ConsoleDestination.self)
+        config.destination(labelled: Self.consoleLabel) as? ConsoleDestination
     }
 
     private var fileDestination: FileDestination? {
-        _destinations.first(where: { $0.label == Self.defaultFileLabel }) as? FileDestination
+        config.destination(labelled: Self.defaultFileLabel) as? FileDestination
     }
 
     // MARK: - Read-Only State
@@ -72,15 +91,13 @@ public final class Logger: @unchecked Sendable {
     /// Custom file destinations registered under a different label do not affect
     /// this property, mirroring ``fileLogging(_:)``, which is also label-scoped.
     public var isFileLoggingActive: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return fileDestination != nil
+        fileDestination != nil
     }
 
     /// Whether `installExceptionHandler()` has been called.
     public var isExceptionHandlerInstalled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
+        writeLock.lock()
+        defer { writeLock.unlock() }
         return _exceptionHandlerInstalled
     }
 
@@ -90,9 +107,7 @@ public final class Logger: @unchecked Sendable {
     /// Default is `.debug`.
     @discardableResult
     public func minimumLevel(_ level: LogLevel) -> Logger {
-        lock.lock()
-        _minimumLogLevel = level
-        lock.unlock()
+        mutateConfig { $0.with(minimumLogLevel: level) }
         return self
     }
 
@@ -100,9 +115,9 @@ public final class Logger: @unchecked Sendable {
     /// The output sink (used by tests) continues to receive messages regardless.
     @discardableResult
     public func consoleLogging(_ enabled: Bool) -> Logger {
-        lock.lock()
+        // Mutates the destination object itself, not the destination list, so no
+        // snapshot swap is needed.
         consoleDestination?.printEnabled = enabled
-        lock.unlock()
         return self
     }
 
@@ -122,21 +137,24 @@ public final class Logger: @unchecked Sendable {
     /// ``isFileLoggingActive`` to verify.
     @discardableResult
     public func fileLogging(_ enabled: Bool) -> Logger {
-        lock.lock()
-        if enabled {
-            if !_destinations.contains(where: { $0.label == Self.defaultFileLabel }) {
-                if let fd = FileDestination() {
-                    _destinations.append(fd)
-                } else {
-                    lock.unlock()
-                    print("[Logger] Failed to enable file logging — could not open log file")
-                    return self
+        var openFailed = false
+        mutateConfig { current in
+            if enabled {
+                guard current.destination(labelled: Self.defaultFileLabel) == nil else { return current }
+                guard let fd = FileDestination() else {
+                    openFailed = true
+                    return current
                 }
+                return current.with(destinations: current.destinations + [fd])
+            } else {
+                return current.with(
+                    destinations: current.destinations.filter { $0.label != Self.defaultFileLabel }
+                )
             }
-        } else {
-            _destinations.removeAll(where: { $0.label == Self.defaultFileLabel })
         }
-        lock.unlock()
+        if openFailed {
+            print("[Logger] Failed to enable file logging — could not open log file")
+        }
         return self
     }
 
@@ -148,37 +166,49 @@ public final class Logger: @unchecked Sendable {
         minimumLevel: LogLevel? = nil,
         rotation: FileRotationConfig? = nil
     ) -> Logger {
-        lock.lock()
-        _destinations.removeAll(where: { $0.label == label })
-        if let fd = FileDestination(url: url, label: label, minimumLevel: minimumLevel, rotationConfig: rotation) {
-            _destinations.append(fd)
-        } else {
-            lock.unlock()
-            print("[Logger] Failed to enable file logging — could not open \(url.path)")
-            return self
+        var openFailed = false
+        mutateConfig { current in
+            guard let fd = FileDestination(
+                url: url,
+                label: label,
+                minimumLevel: minimumLevel,
+                rotationConfig: rotation
+            ) else {
+                openFailed = true
+                return current
+            }
+            return current.with(
+                destinations: current.destinations.filter { $0.label != label } + [fd]
+            )
         }
-        lock.unlock()
+        if openFailed {
+            print("[Logger] Failed to enable file logging — could not open \(url.path)")
+        }
         return self
     }
 
     /// Overrides the minimum log level for messages originating from `fileName`.
     ///
-    /// The file name is matched against the last path component of `#file`
-    /// (e.g. `"ContentAPI.swift"`).
+    /// The file name is matched against the last path component of the call
+    /// site's `#fileID` (e.g. `"ContentAPI.swift"`).
     @discardableResult
     public func logLevel(_ level: LogLevel, forFile fileName: String) -> Logger {
-        lock.lock()
-        _fileLogLevels[fileName] = level
-        lock.unlock()
+        mutateConfig { current in
+            var levels = current.fileLogLevels
+            levels[fileName] = level
+            return current.with(fileLogLevels: levels)
+        }
         return self
     }
 
     /// Removes a per-file log level override, falling back to the global minimum.
     @discardableResult
     public func resetLogLevel(forFile fileName: String) -> Logger {
-        lock.lock()
-        _fileLogLevels.removeValue(forKey: fileName)
-        lock.unlock()
+        mutateConfig { current in
+            var levels = current.fileLogLevels
+            levels.removeValue(forKey: fileName)
+            return current.with(fileLogLevels: levels)
+        }
         return self
     }
 
@@ -195,36 +225,36 @@ public final class Logger: @unchecked Sendable {
     /// 4. Global minimum level
     @discardableResult
     public func subsystem(_ name: String, level: LogLevel) -> Logger {
-        lock.lock()
-        _subsystemLevels[name] = level
-        lock.unlock()
+        mutateConfig { current in
+            var levels = current.subsystemLevels
+            levels[name] = level
+            return current.with(subsystemLevels: levels)
+        }
         return self
     }
 
     /// Removes a subsystem level, falling back to parent subsystems or the global minimum.
     @discardableResult
     public func resetSubsystem(_ name: String) -> Logger {
-        lock.lock()
-        _subsystemLevels.removeValue(forKey: name)
-        lock.unlock()
+        mutateConfig { current in
+            var levels = current.subsystemLevels
+            levels.removeValue(forKey: name)
+            return current.with(subsystemLevels: levels)
+        }
         return self
     }
 
     /// Prefixes log output from `fileName` with `>>>` for visual scanning.
     @discardableResult
     public func highlight(_ fileName: String) -> Logger {
-        lock.lock()
         consoleDestination?.highlight(fileName)
-        lock.unlock()
         return self
     }
 
     /// Removes the highlight prefix for `fileName`.
     @discardableResult
     public func removeHighlight(_ fileName: String) -> Logger {
-        lock.lock()
         consoleDestination?.removeHighlight(fileName)
-        lock.unlock()
         return self
     }
 
@@ -237,15 +267,15 @@ public final class Logger: @unchecked Sendable {
     /// crash reporter such as Firebase Crashlytics or Sentry.
     @discardableResult
     public func installExceptionHandler() -> Logger {
-        lock.lock()
+        writeLock.lock()
         guard !_exceptionHandlerInstalled else {
-            lock.unlock()
+            writeLock.unlock()
             return self
         }
         _previousExceptionHandler = NSGetUncaughtExceptionHandler()
         _exceptionHandlerInstalled = true
         let registrar = exceptionHandlerRegistrar
-        lock.unlock()
+        writeLock.unlock()
 
         registrar { exception in
             Logger.shared.handleException(exception)
@@ -261,19 +291,20 @@ public final class Logger: @unchecked Sendable {
     /// If a destination with the same `label` already exists, it is replaced.
     @discardableResult
     public func addDestination(_ destination: any LogDestination) -> Logger {
-        lock.lock()
-        _destinations.removeAll(where: { $0.label == destination.label })
-        _destinations.append(destination)
-        lock.unlock()
+        mutateConfig { current in
+            current.with(
+                destinations: current.destinations.filter { $0.label != destination.label } + [destination]
+            )
+        }
         return self
     }
 
     /// Removes a destination by label.
     @discardableResult
     public func removeDestination(label: String) -> Logger {
-        lock.lock()
-        _destinations.removeAll(where: { $0.label == label })
-        lock.unlock()
+        mutateConfig { current in
+            current.with(destinations: current.destinations.filter { $0.label != label })
+        }
         return self
     }
 
@@ -286,10 +317,7 @@ public final class Logger: @unchecked Sendable {
     /// `atexit` handler — to guarantee queued entries reach disk. It is safe to call
     /// at any time and on any thread.
     public func flush() {
-        lock.lock()
-        let destinations = _destinations
-        lock.unlock()
-        for destination in destinations {
+        for destination in config.destinations {
             destination.flush()
         }
     }
@@ -326,21 +354,6 @@ public final class Logger: @unchecked Sendable {
         ScopedLogger(logger: self, correlation: correlation, subsystem: subsystem)
     }
 
-    // MARK: - Subsystem Level Resolution
-
-    private func resolveSubsystemLevel(_ name: String) -> LogLevel? {
-        var current = name
-        while true {
-            if let level = _subsystemLevels[current] {
-                return level
-            }
-            guard let dotIndex = current.lastIndex(of: ".") else {
-                return nil
-            }
-            current = String(current[current.startIndex..<dotIndex])
-        }
-    }
-
     // MARK: - callAsFunction
 
     /// Shorthand for ``log(_:level:subsystem:metadata:correlation:file:function:line:)``,
@@ -351,7 +364,7 @@ public final class Logger: @unchecked Sendable {
         subsystem: String? = nil,
         metadata: LogMetadata? = nil,
         correlation: String? = nil,
-        file: String = #file,
+        file: String = #fileID,
         function: String = #function,
         line: Int = #line
     ) {
@@ -370,7 +383,7 @@ public final class Logger: @unchecked Sendable {
         subsystem: String? = nil,
         metadata: LogMetadata? = nil,
         correlation: String? = nil,
-        file: String = #file,
+        file: String = #fileID,
         function: String = #function,
         line: Int = #line
     ) {
@@ -387,26 +400,40 @@ public final class Logger: @unchecked Sendable {
         subsystem: String? = nil,
         metadata: LogMetadata? = nil,
         correlation: String? = nil,
-        file: String = #file,
+        file: String = #fileID,
         function: String = #function,
         line: Int = #line
     ) {
-        let fileName = (file as NSString).lastPathComponent
+        let config = self.config
 
-        lock.lock()
-        let subsystemLevel = subsystem.flatMap { resolveSubsystemLevel($0) }
-        let fileLevel = _fileLogLevels[fileName]
-        let effectiveLevel = subsystemLevel ?? fileLevel ?? _minimumLogLevel
-        let destinations = _destinations
-        lock.unlock()
+        // Deriving the file name costs a string scan, and a filtered-out message
+        // never needs it. Resolve the level with the cheapest sufficient
+        // information: a subsystem level wins outright, and per-file lookup only
+        // happens when overrides actually exist.
+        var fileName: String? = nil
+        let effectiveLevel: LogLevel
+        if let subsystemLevel = subsystem.flatMap({ config.resolveSubsystemLevel($0) }) {
+            effectiveLevel = subsystemLevel
+        } else if config.hasFileLevelOverrides {
+            let name = Self.lastPathComponent(of: file)
+            fileName = name
+            effectiveLevel = config.fileLogLevels[name] ?? config.minimumLogLevel
+        } else {
+            effectiveLevel = config.minimumLogLevel
+        }
 
         guard level >= effectiveLevel else { return }
 
-        // Check isEnabled and minimumLevel outside the lock
-        let hasActiveDestination = destinations.contains { dest in
-            dest.isEnabled && (dest.minimumLevel.map { level >= $0 } ?? true)
+        // Resolve each destination's `isEnabled`/`minimumLevel` once. Both are
+        // lock-guarded computed properties on some destinations, so the previous
+        // "any active?" prescan followed by a second read in the write loop paid
+        // for them twice.
+        var writable: [any LogDestination] = []
+        for destination in config.destinations where destination.isEnabled {
+            if let destMin = destination.minimumLevel, level < destMin { continue }
+            writable.append(destination)
         }
-        guard hasActiveDestination else { return }
+        guard !writable.isEmpty else { return }
 
         let entry = LogEntry(
             timestamp: Date(),
@@ -415,15 +442,23 @@ public final class Logger: @unchecked Sendable {
             metadata: metadata,
             correlation: correlation,
             subsystem: subsystem,
-            fileName: fileName,
+            fileName: fileName ?? Self.lastPathComponent(of: file),
             function: function,
             line: line
         )
 
-        for destination in destinations where destination.isEnabled {
-            if let destMin = destination.minimumLevel, level < destMin { continue }
+        for destination in writable {
             destination.write(entry)
         }
+    }
+
+    /// Native-Swift last path component. `#fileID` yields `"Module/File.swift"`,
+    /// and callers may pass a full `#file` path; both reduce to the trailing
+    /// segment. Avoids the `NSString` bridge this used to pay on every call.
+    @inline(__always)
+    private static func lastPathComponent(of path: String) -> String {
+        guard let slash = path.lastIndex(of: "/") else { return path }
+        return String(path[path.index(after: slash)...])
     }
 
     // MARK: - Exception Handling
@@ -437,10 +472,11 @@ public final class Logger: @unchecked Sendable {
         """
         log("Crash occurred:\n\(crashLog)", level: .error)
 
-        lock.lock()
         let fd = fileDestination
+
+        writeLock.lock()
         let previousHandler = _previousExceptionHandler
-        lock.unlock()
+        writeLock.unlock()
 
         fd?.forceSave(crashLog)
 
@@ -449,22 +485,21 @@ public final class Logger: @unchecked Sendable {
 
     // MARK: - Test Support
 
+    internal func destinationForTesting(label: String) -> (any LogDestination)? {
+        config.destination(labelled: label)
+    }
+
     internal func setOutputSink(_ sink: ((String) -> Void)?) {
-        lock.lock()
         consoleDestination?.setOutputSink(sink)
-        lock.unlock()
     }
 
     internal func reset() {
-        lock.lock()
-        _minimumLogLevel = .debug
-        _fileLogLevels = [:]
-        _subsystemLevels = [:]
-        _destinations = [ConsoleDestination()]
+        writeLock.lock()
+        configLock.withLock { _config = .makeDefault() }
         _exceptionHandlerInstalled = false
         _previousExceptionHandler = nil
         exceptionHandlerRegistrar = Self.defaultRegistrar
-        lock.unlock()
+        writeLock.unlock()
     }
 }
 
@@ -479,31 +514,31 @@ public let Log = Logger.shared
 // MARK: - Global Convenience Functions
 
 /// Logs a message at `.verbose` level.
-public func logVerbose(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+public func logVerbose(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .verbose, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.debug` level.
-public func logDebug(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+public func logDebug(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .debug, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.info` level.
-public func logInfo(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+public func logInfo(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .info, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.warning` level.
-public func logWarning(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+public func logWarning(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .warning, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.error` level.
-public func logError(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+public func logError(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .error, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }
 
 /// Logs a message at `.todo` level — marks incomplete work.
-public func logTODO(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+public func logTODO(_ message: @autoclosure () -> String, subsystem: String? = nil, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
     Log.logMessage(message, level: .todo, subsystem: subsystem, metadata: metadata, file: file, function: function, line: line)
 }

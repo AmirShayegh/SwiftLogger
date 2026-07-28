@@ -33,7 +33,7 @@ public struct ScopedLogger: Sendable {
         _ message: @autoclosure () -> String,
         level: LogLevel = .info,
         metadata: LogMetadata? = nil,
-        file: String = #file,
+        file: String = #fileID,
         function: String = #function,
         line: Int = #line
     ) {
@@ -49,27 +49,27 @@ public struct ScopedLogger: Sendable {
         )
     }
 
-    public func verbose(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+    public func verbose(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
         logger.logMessage(message, level: .verbose, subsystem: subsystem, metadata: metadata, correlation: correlation, file: file, function: function, line: line)
     }
 
-    public func debug(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+    public func debug(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
         logger.logMessage(message, level: .debug, subsystem: subsystem, metadata: metadata, correlation: correlation, file: file, function: function, line: line)
     }
 
-    public func info(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+    public func info(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
         logger.logMessage(message, level: .info, subsystem: subsystem, metadata: metadata, correlation: correlation, file: file, function: function, line: line)
     }
 
-    public func warning(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+    public func warning(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
         logger.logMessage(message, level: .warning, subsystem: subsystem, metadata: metadata, correlation: correlation, file: file, function: function, line: line)
     }
 
-    public func error(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+    public func error(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
         logger.logMessage(message, level: .error, subsystem: subsystem, metadata: metadata, correlation: correlation, file: file, function: function, line: line)
     }
 
-    public func todo(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #file, function: String = #function, line: Int = #line) {
+    public func todo(_ message: @autoclosure () -> String, metadata: LogMetadata? = nil, file: String = #fileID, function: String = #function, line: Int = #line) {
         logger.logMessage(message, level: .todo, subsystem: subsystem, metadata: metadata, correlation: correlation, file: file, function: function, line: line)
     }
 
