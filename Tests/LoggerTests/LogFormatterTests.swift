@@ -229,6 +229,91 @@ extension AllLoggerTests {
             #expect(try String(contentsOf: url, encoding: .utf8) == "<INFO>terse\n")
         }
 
+        // MARK: - Default format, byte for byte
+
+        // Characterization pins for the default text line. Every separator,
+        // space, and bracket is asserted literally, so a rewrite of the
+        // formatter that changes the output by even one character fails here
+        // rather than silently breaking everyone's log parsers. The timestamp
+        // is spliced in from TimestampFormatter rather than hardcoded, so these
+        // are independent of the machine's time zone.
+
+        @Test func defaultFormatExactLineShape() {
+            let timestamp = Date(timeIntervalSince1970: 1_752_003_661.234)
+            let entry = LogEntry(
+                timestamp: timestamp,
+                level: .warning,
+                message: "hello",
+                metadata: ["k": 1],
+                correlation: "corr",
+                subsystem: "sub",
+                fileName: "F.swift",
+                function: "f()",
+                line: 12
+            )
+
+            let ts = TimestampFormatter.string(from: timestamp)
+            #expect(entry.format() == " WARN | \(ts) | F.swift:12 | [corr] [sub] hello {k=1}")
+        }
+
+        @Test func defaultFormatExactLineShapeWithoutTags() {
+            let timestamp = Date(timeIntervalSince1970: 1_752_003_661.234)
+            let entry = LogEntry(
+                timestamp: timestamp,
+                level: .error,
+                message: "plain",
+                fileName: "G.swift",
+                line: 3
+            )
+
+            let ts = TimestampFormatter.string(from: timestamp)
+            #expect(entry.format() == "ERROR | \(ts) | G.swift:3 | plain")
+        }
+
+        @Test func defaultFormatOmitsEmptyMetadataBraces() {
+            let timestamp = Date(timeIntervalSince1970: 1_752_003_661.234)
+            let entry = LogEntry(
+                timestamp: timestamp,
+                level: .info,
+                message: "no meta",
+                metadata: [:],
+                correlation: "c-1",
+                fileName: "H.swift",
+                line: 1
+            )
+
+            let ts = TimestampFormatter.string(from: timestamp)
+            #expect(entry.format() == " INFO | \(ts) | H.swift:1 | [c-1] no meta")
+        }
+
+        @Test func defaultFormatRendersEveryLevelTagAtFixedWidth() {
+            let timestamp = Date(timeIntervalSince1970: 1_752_003_661.234)
+            let ts = TimestampFormatter.string(from: timestamp)
+            let expected: [(LogLevel, String)] = [
+                (.verbose, "TRACE"),
+                (.debug, "DEBUG"),
+                (.info, " INFO"),
+                (.warning, " WARN"),
+                (.error, "ERROR"),
+                (.todo, " TODO"),
+            ]
+            for (level, tag) in expected {
+                let entry = LogEntry(
+                    timestamp: timestamp, level: level, message: "m", fileName: "I.swift", line: 9
+                )
+                #expect(entry.format() == "\(tag) | \(ts) | I.swift:9 | m")
+            }
+        }
+
+        @Test func defaultFormatSortsMetadataAndSeparatesWithCommaSpace() {
+            let entry = LogEntry(
+                level: .info,
+                message: "m",
+                metadata: ["zebra": 1, "alpha": "a", "middle": true, "delta": 2.5]
+            )
+            #expect(entry.format().hasSuffix(" | m {alpha=a, delta=2.5, middle=true, zebra=1}"))
+        }
+
         @Test func multiByteMessagesSurviveLineEncodingIntact() throws {
             struct PassthroughFormatter: LogFormatter {
                 func format(_ entry: LogEntry) -> String { entry.message }

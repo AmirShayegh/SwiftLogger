@@ -126,40 +126,81 @@ public struct LogEntry: Sendable {
         return computeDefaultFormat()
     }
 
+    /// Builds the default line in a single reserved buffer.
+    ///
+    /// The output is byte-identical to the interpolation-per-part version this
+    /// replaced (pinned by the characterization tests in `LogFormatterTests`);
+    /// what changes is that the intermediate `tags` and `body` strings, and the
+    /// separate metadata string, are gone. Every piece is appended straight
+    /// into one buffer whose capacity is computed up front.
     internal func computeDefaultFormat() -> String {
         LogEntryFormatCache.noteComputation()
 
-        let formattedTimestamp = TimestampFormatter.string(from: timestamp)
+        let levelTag = level.tag
+        let lineNumber = String(line)
 
-        var tags = ""
-        if let corr = correlation {
-            tags += "[\(corr)] "
+        // "TAG | HH:mm:ss.SSS | file:line | " is the fixed scaffolding; the
+        // rest is a close-enough estimate to avoid a reallocation.
+        var capacity = levelTag.utf8.count + 3 + 12 + 3
+            + fileName.utf8.count + 1 + lineNumber.utf8.count + 3
+            + message.utf8.count
+        if let correlation { capacity += correlation.utf8.count + 3 }
+        if let subsystem { capacity += subsystem.utf8.count + 3 }
+        if let metadata, !metadata.isEmpty { capacity += metadata.count * 24 + 2 }
+
+        var out = ""
+        out.reserveCapacity(capacity)
+
+        out += levelTag
+        out += " | "
+        out += TimestampFormatter.string(from: timestamp)
+        out += " | "
+        out += fileName
+        out += ":"
+        out += lineNumber
+        out += " | "
+        if let correlation {
+            out += "["
+            out += correlation
+            out += "] "
         }
-        if let sub = subsystem {
-            tags += "[\(sub)] "
+        if let subsystem {
+            out += "["
+            out += subsystem
+            out += "] "
+        }
+        out += message
+        if let metadata, !metadata.isEmpty {
+            out += " {"
+            Self.appendMetadata(metadata, to: &out)
+            out += "}"
         }
 
-        var body = "\(tags)\(message)"
-        if let meta = metadata, !meta.isEmpty {
-            body += " {\(Self.formatMetadata(meta))}"
-        }
-
-        return "\(level.tag) | \(formattedTimestamp) | \(fileName):\(line) | \(body)"
+        return out
     }
 
-    /// Renders metadata as `key=value` pairs ordered by key.
+    /// Appends metadata as `key=value` pairs ordered by key.
     ///
     /// Sorting the keys rather than the rendered pairs avoids building a
     /// throwaway string per entry just to order them, and sorts by what the
     /// ordering is actually meant to be keyed on.
-    internal static func formatMetadata(_ metadata: LogMetadata) -> String {
-        var result = ""
+    internal static func appendMetadata(_ metadata: LogMetadata, to out: inout String) {
         var first = true
         for key in metadata.keys.sorted() {
-            if !first { result += ", " }
-            result += "\(key)=\(metadata[key]!)"
+            if !first { out += ", " }
+            out += key
+            out += "="
+            out += metadata[key]!.description
             first = false
         }
+    }
+
+    /// Renders metadata as `key=value` pairs ordered by key. Kept so callers
+    /// that need the fragment on its own — `OSLogDestination` — stay consistent
+    /// with the default text format.
+    internal static func formatMetadata(_ metadata: LogMetadata) -> String {
+        var result = ""
+        appendMetadata(metadata, to: &result)
         return result
     }
 }
