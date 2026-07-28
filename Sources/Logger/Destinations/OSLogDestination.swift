@@ -54,14 +54,20 @@ public final class OSLogDestination: LogDestination, @unchecked Sendable {
 
     // MARK: - Message Formatting
 
-    private static func formatMessage(_ entry: LogEntry) -> String {
+    /// Structured fields are escaped for control characters, matching the
+    /// default text format; the message itself stays free-form.
+    internal static func formatMessage(_ entry: LogEntry) -> String {
         var parts: [String] = []
 
         if let corr = entry.correlation {
-            parts.append("[\(corr)]")
+            var escaped = "["
+            LogEntry.appendEscapingControlCharacters(corr, to: &escaped)
+            parts.append(escaped + "]")
         }
         if let sub = entry.subsystem {
-            parts.append("[\(sub)]")
+            var escaped = "["
+            LogEntry.appendEscapingControlCharacters(sub, to: &escaped)
+            parts.append(escaped + "]")
         }
         parts.append(entry.message)
 

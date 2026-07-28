@@ -324,6 +324,83 @@ extension AllLoggerTests {
             #expect(metadata["key\"with quote"] as? String == "value\nwith newline")
         }
 
+        // MARK: - Log injection
+
+        @Test func forgedLineViaMetadataValueStaysOnOneLine() {
+            // The classic log-injection payload: a newline plus a plausible
+            // second entry. Anything reaching metadata from a request header, a
+            // username, or a URL is attacker-controlled, and the default format
+            // is one entry per line — so an unescaped newline writes a fake log
+            // entry that a human or a parser will believe.
+            let entry = LogEntry(
+                level: .info,
+                message: "login",
+                metadata: ["user": "bob\n INFO | 00:00:00.000 | Auth.swift:1 | admin granted"],
+                fileName: "Auth.swift",
+                line: 4
+            )
+            let line = entry.format()
+            #expect(!line.contains("\n"))
+            #expect(line.contains("\\n"))
+            #expect(line.hasSuffix("admin granted}"))
+        }
+
+        @Test func forgedLineViaCorrelationOrSubsystemStaysOnOneLine() {
+            let entry = LogEntry(
+                level: .info,
+                message: "m",
+                correlation: "c\r\nforged",
+                subsystem: "sub\nforged",
+                fileName: "F.swift",
+                line: 1
+            )
+            let line = entry.format()
+            #expect(!line.contains("\n"))
+            #expect(!line.contains("\r"))
+            #expect(line.contains("[c\\r\\nforged]"))
+            #expect(line.contains("[sub\\nforged]"))
+        }
+
+        @Test func metadataKeysAreEscapedToo() {
+            let entry = LogEntry(level: .info, message: "m", metadata: ["a\nb": 1])
+            let line = entry.format()
+            #expect(!line.contains("\n"))
+            #expect(line.contains("{a\\nb=1}"))
+        }
+
+        @Test func otherControlCharactersRenderAsUnicodeEscapes() {
+            let entry = LogEntry(level: .info, message: "m", metadata: ["k": "a\u{07}b\u{00}c\u{7F}d\te"])
+            let line = entry.format()
+            #expect(line.contains("a\\u{7}b\\u{0}c\\u{7F}d\\te"))
+        }
+
+        @Test func cleanFieldsAreUntouchedByEscaping() {
+            // The fast path must not disturb ordinary text, including non-ASCII.
+            let entry = LogEntry(
+                level: .info,
+                message: "m",
+                metadata: ["path": "/users/José/naïve 🌍"],
+                correlation: "req-42",
+                subsystem: "net.api",
+                fileName: "F.swift",
+                line: 1
+            )
+            let line = entry.format()
+            #expect(line.contains("[req-42] [net.api]"))
+            #expect(line.contains("{path=/users/José/naïve 🌍}"))
+        }
+
+        @Test func multiLineMessagesStillRenderMultiLine() {
+            // Messages are free-form on purpose: the uncaught-exception handler
+            // logs a whole stack trace through one. Escaping it would turn every
+            // crash report into an unreadable single line.
+            let trace = "Crash occurred:\nException Name: NSInvalidArgument\nStack Trace:\n0  frame\n1  frame"
+            let entry = LogEntry(level: .error, message: trace, fileName: "Logger.swift", line: 1)
+            let line = entry.format()
+            #expect(line.contains("\n"))
+            #expect(line.hasSuffix("1  frame"))
+        }
+
         // MARK: - Default format, byte for byte
 
         // Characterization pins for the default text line. Every separator,

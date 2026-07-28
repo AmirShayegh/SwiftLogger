@@ -161,12 +161,12 @@ public struct LogEntry: Sendable {
         out += " | "
         if let correlation {
             out += "["
-            out += correlation
+            Self.appendEscapingControlCharacters(correlation, to: &out)
             out += "] "
         }
         if let subsystem {
             out += "["
-            out += subsystem
+            Self.appendEscapingControlCharacters(subsystem, to: &out)
             out += "] "
         }
         out += message
@@ -179,6 +179,42 @@ public struct LogEntry: Sendable {
         return out
     }
 
+    /// Appends `field` with C0 control characters rendered as escapes.
+    ///
+    /// The default format is one entry per line, so a newline inside a
+    /// *structured* field — a correlation ID, a subsystem, a metadata value —
+    /// lets attacker-controlled input forge whole log entries. Anything that
+    /// reaches these fields from a request header, a username, or a URL can
+    /// otherwise write a convincing fake line into the log.
+    ///
+    /// Deliberately NOT applied to `message`: the crash handler logs multi-line
+    /// stack traces through it by design, and messages are documented as
+    /// free-form. The JSON formatter escapes everything already.
+    ///
+    /// Clean fields — essentially all of them — are scanned once and appended
+    /// whole, so this costs nothing in the normal case.
+    internal static func appendEscapingControlCharacters(_ field: String, to out: inout String) {
+        guard field.utf8.contains(where: { $0 < 0x20 || $0 == 0x7F }) else {
+            out += field
+            return
+        }
+        for scalar in field.unicodeScalars {
+            switch scalar {
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if scalar.value < 0x20 || scalar.value == 0x7F {
+                    out += "\\u{"
+                    out += String(scalar.value, radix: 16, uppercase: true)
+                    out += "}"
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+    }
+
     /// Appends metadata as `key=value` pairs ordered by key.
     ///
     /// Sorting the keys rather than the rendered pairs avoids building a
@@ -188,9 +224,10 @@ public struct LogEntry: Sendable {
         var first = true
         for key in metadata.keys.sorted() {
             if !first { out += ", " }
-            out += key
+            // Keys as well as values: both can carry attacker-controlled text.
+            appendEscapingControlCharacters(key, to: &out)
             out += "="
-            out += metadata[key]!.description
+            appendEscapingControlCharacters(metadata[key]!.description, to: &out)
             first = false
         }
     }
