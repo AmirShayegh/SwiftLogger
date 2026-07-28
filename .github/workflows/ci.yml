@@ -27,10 +27,8 @@ jobs:
             command: swift test -v
           - name: Thread Sanitizer
             command: swift test --sanitize=thread
-          - name: Release build
-            # Build-only for now: `swift test -c release` lands once the
-            # debug-only format-cache counters are compiled out under #if DEBUG.
-            command: swift build -c release -v
+          - name: Release tests
+            command: swift test -c release
     steps:
       - uses: actions/checkout@v4
 

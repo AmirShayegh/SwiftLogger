@@ -76,9 +76,16 @@ extension AllLoggerTests {
     /// entry fans out to several destinations.
     struct FormatCacheTests {
 
+        // The compute counter is compiled out of release builds, and
+        // `swift test -c release` builds the test target without DEBUG too — so
+        // every reference to it is gated at source level. The behavioural
+        // assertions stay unconditional in both configurations.
+
         init() {
             Logger.shared.reset()
+            #if DEBUG
             LogEntryFormatCache.resetComputeCountForTesting()
+            #endif
         }
 
         @Test func fanOutToMultipleDestinationsFormatsOnce() {
@@ -91,10 +98,14 @@ extension AllLoggerTests {
             let c = FormattingDestination(label: "fmt-c")
             Logger.shared.addDestination(a).addDestination(b).addDestination(c)
 
+            #if DEBUG
             LogEntryFormatCache.resetComputeCountForTesting()
+            #endif
             Logger.shared.log("shared line", level: .error)
 
+            #if DEBUG
             #expect(LogEntryFormatCache.computeCount == 1)
+            #endif
             #expect(a.lines == b.lines)
             #expect(b.lines == c.lines)
             #expect(a.lines.first?.contains("shared line") == true)
@@ -105,12 +116,17 @@ extension AllLoggerTests {
             let only = FormattingDestination(label: "fmt-only")
             Logger.shared.addDestination(only)
 
+            #if DEBUG
             LogEntryFormatCache.resetComputeCountForTesting()
+            #endif
             Logger.shared.log("solo line", level: .error)
 
             // One destination, one computation — and no cache box was allocated.
+            #if DEBUG
             #expect(LogEntryFormatCache.computeCount == 1)
+            #endif
             #expect(only.lines.count == 1)
+            #expect(only.entries[0].hasFormatCacheForTesting == false)
         }
 
         @Test func repeatedFormatCallsOnCopiesComputeOnce() {
@@ -119,28 +135,40 @@ extension AllLoggerTests {
             let b = FormattingDestination(label: "fmt-b")
             Logger.shared.addDestination(a).addDestination(b)
 
+            #if DEBUG
             LogEntryFormatCache.resetComputeCountForTesting()
+            #endif
             Logger.shared.log("copy me", level: .error)
 
             // Re-format the entry a destination kept, plus a struct copy of it:
             // the cache reference is shared across copies, so still one compute.
             let kept = a.entries[0]
             let copy = kept
-            _ = kept.format()
-            _ = copy.format()
+            let fromKept = kept.format()
+            let fromCopy = copy.format()
 
+            #if DEBUG
             #expect(LogEntryFormatCache.computeCount == 1)
+            #endif
+            #expect(kept.hasFormatCacheForTesting)
+            #expect(fromKept == fromCopy)
+            #expect(fromKept == a.lines[0])
         }
 
         @Test func directlyConstructedEntriesStillFormat() {
             // A LogEntry built through the public initialiser has no cache box.
             // It must still format correctly, just without sharing.
+            #if DEBUG
             LogEntryFormatCache.resetComputeCountForTesting()
+            #endif
             let entry = LogEntry(level: .warning, message: "manual", fileName: "Manual.swift", line: 7)
 
             #expect(entry.format() == entry.format())
             #expect(entry.format().contains("manual"))
+            #expect(entry.hasFormatCacheForTesting == false)
+            #if DEBUG
             #expect(LogEntryFormatCache.computeCount == 3)
+            #endif
         }
 
         @Test func metadataIsOrderedByKey() {

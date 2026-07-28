@@ -9,8 +9,13 @@ internal final class LogEntryFormatCache: @unchecked Sendable {
     private let lock = UnfairLock()
     private var line: String?
 
+    #if DEBUG
     /// Test hook: how many times a line was actually computed, to prove the
     /// cache is doing its job.
+    ///
+    /// Debug-only. In release this counter would be a process-wide lock taken
+    /// on every single formatted entry — a serialisation point between threads
+    /// that exists purely to satisfy a test assertion.
     private static let computeCountLock = UnfairLock()
     private static var _computeCount = 0
     internal static var computeCount: Int {
@@ -19,6 +24,7 @@ internal final class LogEntryFormatCache: @unchecked Sendable {
     internal static func resetComputeCountForTesting() {
         computeCountLock.withLock { _computeCount = 0 }
     }
+    #endif
 
     func line(for entry: LogEntry) -> String {
         lock.withLock {
@@ -29,8 +35,11 @@ internal final class LogEntryFormatCache: @unchecked Sendable {
         }
     }
 
+    @inline(__always)
     static func noteComputation() {
+        #if DEBUG
         computeCountLock.withLock { _computeCount += 1 }
+        #endif
     }
 }
 
@@ -51,6 +60,11 @@ public struct LogEntry: Sendable {
     /// entry leaves this `nil` and formats directly, so the common case adds
     /// nothing.
     internal let formatCache: LogEntryFormatCache?
+
+    /// Whether this entry carries a shared format cache. Lets the tests assert
+    /// the allocation policy in release builds, where the compute counter is
+    /// compiled out.
+    internal var hasFormatCacheForTesting: Bool { formatCache != nil }
 
     public init(
         timestamp: Date = Date(),
