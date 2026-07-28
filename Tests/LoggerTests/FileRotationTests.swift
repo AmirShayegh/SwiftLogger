@@ -164,13 +164,20 @@ extension AllLoggerTests {
             #expect(!found.isEmpty)
         }
 
-        @Test func concurrentWritesWithRotationNoCrash() async throws {
+        @Test func concurrentWritesWithRotationPreserveEveryEntry() async throws {
             let dir = try makeTempDir()
             defer { try? FileManager.default.removeItem(at: dir) }
             let logURL = dir.appendingPathComponent("test.log")
 
-            let fd = FileDestination(url: logURL, rotation: FileRotationConfig(maxFileSize: 200, maxArchivedFilesCount: 10))!
+            // Retention well beyond reach, so nothing this test writes is pruned
+            // and "missing" can only mean "lost".
+            let fd = FileDestination(
+                url: logURL,
+                rotation: FileRotationConfig(maxFileSize: 200, maxArchivedFilesCount: 1_000)
+            )!
 
+            // 100 entries, comfortably under the 1_000-entry buffer cap, so no
+            // entry can legitimately be dropped for overflow.
             await withTaskGroup(of: Void.self) { group in
                 for i in 0..<100 {
                     group.addTask {
@@ -180,9 +187,25 @@ extension AllLoggerTests {
             }
             fd.flush()
 
-            // Verify current file exists and is readable
-            let content = try String(contentsOf: logURL, encoding: .utf8)
-            #expect(!content.isEmpty || FileManager.default.fileExists(atPath: logURL.path))
+            // The invariant worth asserting is that serializing writes onto the
+            // destination's queue loses nothing while rotation moves the file
+            // out from under them — not merely that the process survived. The
+            // TSan lane is what hunts for races; this pins the outcome.
+            let rotated = archives(in: dir, baseName: "test.log")
+            // Without this the assertions below would still pass if rotation
+            // never fired, and the test would silently stop covering it.
+            #expect(!rotated.isEmpty, "rotation never fired — nothing was moved out from under the writers")
+
+            var everything = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+            for archive in rotated {
+                everything += (try? String(contentsOf: archive, encoding: .utf8)) ?? ""
+            }
+
+            for i in 0..<100 {
+                // The "-padding" suffix keeps "concurrent-1" from matching
+                // "concurrent-10".
+                #expect(everything.contains("concurrent-\(i)-padding"), "entry \(i) was lost")
+            }
         }
 
         @Test func allEntriesPreservedAcrossRotation() throws {

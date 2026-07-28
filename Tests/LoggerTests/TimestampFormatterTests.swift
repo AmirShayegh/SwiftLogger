@@ -81,10 +81,13 @@ extension AllLoggerTests {
         }
 
         @Test func matchesAroundEveryDSTTransitionInAYear() throws {
-            // Several zones, because which ones still observe DST shifts with
-            // tzdata releases — 2026b puts North America on permanent DST, so
-            // Vancouver springs forward and never falls back. Europe and the
-            // southern hemisphere still supply both directions.
+            // Several zones, because which ones observe DST varies. The window
+            // is a *historical* year on purpose: past transitions are
+            // append-only facts that no tzdata release can remove, so the
+            // gained/lost guards below stay satisfiable forever. Scanning a
+            // future year does not — tzdata 2026b already put North America on
+            // permanent DST, which deleted Vancouver's 2026 fall-back and made
+            // this test's `lost` guard unsatisfiable in that zone.
             let zones = ["America/Vancouver", "Europe/London", "Australia/Sydney"]
                 .compactMap(TimeZone.init(identifier:))
 
@@ -92,8 +95,8 @@ extension AllLoggerTests {
             var lost = false     // saw an offset decrease (fall back)
 
             for zone in zones {
-                // 2026-01-01 .. 2027-01-01 UTC.
-                let transitions = offsetTransitions(in: zone, from: 1_767_225_600, to: 1_798_761_600)
+                // 2021-01-01 .. 2022-01-01 UTC.
+                let transitions = offsetTransitions(in: zone, from: 1_609_459_200, to: 1_640_995_200)
 
                 for transition in transitions {
                     let before = zone.secondsFromGMT(for: transition.addingTimeInterval(-1))
