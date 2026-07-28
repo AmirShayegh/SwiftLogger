@@ -175,18 +175,7 @@ public struct JSONLogFormatter: LogFormatter {
         Unicode.Scalar(nibble < 10 ? 0x30 + nibble : 0x61 + (nibble - 10))
     }
 
-    // One shared formatter behind a lock. Allocating an ISO8601DateFormatter per
-    // entry would cost more than everything else in this method combined, and
-    // the class is not documented as thread-safe.
-    private static let iso8601Lock = UnfairLock()
-    private static let iso8601Formatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        return formatter
-    }()
-
     private static func iso8601(_ date: Date) -> String {
-        iso8601Lock.withLock { iso8601Formatter.string(from: date) }
+        TimestampFormatter.iso8601String(from: date)
     }
 }
