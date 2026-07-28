@@ -18,7 +18,9 @@
 ```
 
 ```swift
-.target(name: "MyApp", dependencies: ["Logger"])
+.target(name: "MyApp", dependencies: [
+    .product(name: "Logger", package: "SwiftLogger")
+])
 ```
 
 ## Usage
@@ -51,7 +53,7 @@ Log.minimumLevel(.info)
 | `minimumLevel(_:)` | `.debug` | Messages below this level are discarded |
 | `consoleLogging(_:)` | `true` | Toggle `print()` output |
 | `fileLogging(_:)` | `false` | Toggle file output to `Library/Logs/app.log`. Check `isFileLoggingActive` to verify. |
-| `fileLogging(url:label:minimumLevel:rotation:)` | -- | File logging to a custom URL with optional rotation |
+| `fileLogging(url:label:minimumLevel:rotation:formatter:)` | -- | File logging to a custom URL with optional rotation |
 | `logLevel(_:forFile:)` | -- | Override level for a specific source file |
 | `highlight(_:)` | -- | Prefix output from a file with `>>>` |
 | `installExceptionHandler()` | off | Log uncaught `NSException`s. **Not a crash reporter** — use Crashlytics or Sentry for signal-based crashes (SIGSEGV, SIGABRT, etc.). |
@@ -187,6 +189,12 @@ Log.addDestination(ConsoleDestination())                          // DefaultLogF
 
 `JSONLogFormatter` writes one self-contained JSON object per line (JSON Lines). Keys are emitted in a fixed order so output diffs cleanly, absent optionals are omitted rather than written as `null`, and metadata values keep their JSON types -- `LogValue.int` becomes a number, `.bool` a boolean. Pass `JSONLogFormatter(timestampStyle: .epochSeconds)` for numeric timestamps.
 
+#### Control characters
+
+`DefaultLogFormatter` escapes control characters in the *structured* fields -- metadata keys and values, correlation, and subsystem -- rendering them as `\n`, `\t`, `\u{XX}`. Attacker-controlled data in those fields therefore cannot forge a log line. `OSLogDestination` does the same.
+
+The **message is deliberately left free-form**: the exception handler writes multi-line stack traces through it, and escaping those would make crash reports unreadable. `JSONLogFormatter` escapes everything, message included, because JSON requires it.
+
 Write your own by conforming to the protocol:
 
 ```swift
@@ -258,7 +266,21 @@ The buffer holds at most 1000 entries. Past that, **new entries are dropped** ra
  WARN | 12:15:30.842 | FileDestination.swift:0 | [Logger] dropped 42 messages — write buffer full
 ```
 
-Call `Log.flush()` to drain the buffer synchronously; it is also drained when the destination is deallocated, so entries are not lost when you swap destinations out. At process exit, call `flush()` from `applicationWillTerminate` or an `atexit` handler.
+A failed *write* is reported separately, so the notice names the real fault rather than blaming the buffer:
+
+```
+ WARN | 12:15:30.842 | FileDestination.swift:0 | [Logger] dropped 3 messages — could not be written to myapp.log
+```
+
+### Recovery
+
+If the file is deleted or replaced out from under the destination, writes to the now-unlinked inode would otherwise succeed forever and land nowhere. The destination periodically checks that its descriptor still refers to a linked file and reopens when it does not, which catches both a plain delete and a delete-then-recreate.
+
+If reopening fails -- the directory is gone, the disk is full -- the destination goes *degraded* and retries on a backoff instead of hammering the filesystem on every flush. The three paths that promise durability (`flush()`, the crash handler's `forceSave`, and deallocation) ignore the backoff and retry immediately, because for them the alternative to retrying now is discarding the buffer.
+
+### Draining
+
+Call `Log.flush()` to drain synchronously. Buffers are also drained when a destination is replaced or removed -- `addDestination`, `removeDestination`, `fileLogging(url:)` and `reset()` all drain the outgoing destination before releasing it, so swapping destinations loses nothing. At process exit, call `flush()` from `applicationWillTerminate` or an `atexit` handler.
 
 ## OSLog
 
@@ -297,9 +319,17 @@ Level mapping: trace -> verbose, debug -> debug, info -> info, notice -> info, w
 
 ## Thread Safety
 
-All logger state is lock-protected. Each destination manages its own synchronization. `ScopedLogger` is a `Sendable` value type. File writes are serialized on a dedicated dispatch queue. `DateFormatter` instances are thread-local to avoid contention.
+Configuration is an immutable snapshot. Changing anything builds a new snapshot and swaps the reference under a lock, so the logging path takes that lock only long enough to load a pointer — never across formatting or I/O. Readers always see one internally consistent configuration; a mutation is never observed half-applied.
 
-Custom destinations must be `Sendable`. `write()` and `flush()` may be called concurrently from arbitrary threads.
+Each destination owns its synchronization. `FileDestination` buffers entries and drains them in batches on a dedicated serial queue, with a bounded buffer that drops the newest entry rather than blocking the caller when the disk falls behind; dropped counts are reported in the log itself. Its file handle is opened `O_APPEND`, so concurrent handles on the same file can never overwrite each other.
+
+Timestamp rendering is integer arithmetic against a cached UTC offset — no `DateFormatter` on the hot path. A locked `ISO8601DateFormatter` remains only as a cold fallback for dates outside the Gregorian range the fast path covers.
+
+`ScopedLogger` is a `Sendable` value type holding no mutable state.
+
+Custom destinations must be `Sendable`. `write()` and `flush()` may be called concurrently from arbitrary threads. A custom `LogFormatter` may log back into the logger — including reconfiguring it — without deadlocking.
+
+Call `Log.flush()` before terminating (e.g. in `applicationWillTerminate`) to guarantee buffered entries reach storage.
 
 ## License
 

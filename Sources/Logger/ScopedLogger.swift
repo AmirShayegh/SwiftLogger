@@ -3,7 +3,7 @@ import Foundation
 /// A lightweight, `Sendable` logger that tags every message with a correlation ID
 /// and optional default subsystem.
 ///
-/// Created via ``Logger/scoped(correlation:subsystem:)``. Scoped loggers delegate
+/// Created via ``Logger/scoped(correlation:subsystem:metadata:)``. Scoped loggers delegate
 /// all work to the parent `Logger` — they carry no mutable state of their own.
 ///
 ///     let job = Log.scoped(correlation: "job-\(id)", subsystem: "decoder")

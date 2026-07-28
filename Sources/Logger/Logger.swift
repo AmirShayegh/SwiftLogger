@@ -66,7 +66,7 @@ public final class Logger: @unchecked Sendable {
     // MARK: - Configuration Access
 
     /// Label identifying the default file destination managed by ``fileLogging(_:)``.
-    /// Matches the default label of ``fileLogging(url:label:minimumLevel:rotation:)``
+    /// Matches the default label of ``fileLogging(url:label:minimumLevel:rotation:formatter:)``
     /// and the internal `FileDestination` convenience initializer.
     private static let defaultFileLabel = "file"
 
@@ -196,7 +196,7 @@ public final class Logger: @unchecked Sendable {
     ///
     /// This method operates strictly on that default destination, identified by its
     /// `"file"` label. Custom file destinations registered via
-    /// ``fileLogging(url:label:minimumLevel:rotation:)`` with a different label are
+    /// ``fileLogging(url:label:minimumLevel:rotation:formatter:)`` with a different label are
     /// left untouched — enabling adds the default alongside them, and disabling
     /// removes only the default. To remove a custom destination, use
     /// ``removeDestination(label:)``.
