@@ -61,12 +61,16 @@ public final class Logger: @unchecked Sendable {
     }
 
     private var fileDestination: FileDestination? {
-        destination(ofType: FileDestination.self)
+        _destinations.first(where: { $0.label == Self.defaultFileLabel }) as? FileDestination
     }
 
     // MARK: - Read-Only State
 
-    /// Whether file logging is both enabled and has a valid file handle.
+    /// Whether the *default* file destination — the one managed by ``fileLogging(_:)``
+    /// under the `"file"` label — is registered and holds a valid file handle.
+    ///
+    /// Custom file destinations registered under a different label do not affect
+    /// this property, mirroring ``fileLogging(_:)``, which is also label-scoped.
     public var isFileLoggingActive: Bool {
         lock.lock()
         defer { lock.unlock() }

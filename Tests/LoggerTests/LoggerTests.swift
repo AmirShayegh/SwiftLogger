@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 @testable import Logger
 
 @Suite(.serialized)
@@ -93,6 +94,26 @@ struct AllLoggerTests {
             Logger.shared.fileLogging(true)
             Logger.shared.fileLogging(false)
             #expect(!Logger.shared.isFileLoggingActive)
+        }
+
+        @Test func isFileLoggingActiveIgnoresCustomLabelledFileDestinations() throws {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("custom-label-\(UUID().uuidString).log")
+            defer { try? FileManager.default.removeItem(at: url) }
+
+            // A file destination under a non-default label must not make the
+            // default-file-logging flag report active.
+            Logger.shared.fileLogging(url: url, label: "crashlog")
+            #expect(!Logger.shared.isFileLoggingActive)
+
+            Logger.shared.fileLogging(true)
+            #expect(Logger.shared.isFileLoggingActive)
+
+            // Disabling the default leaves the custom destination in place.
+            Logger.shared.fileLogging(false)
+            #expect(!Logger.shared.isFileLoggingActive)
+
+            Logger.shared.removeDestination(label: "crashlog")
         }
 
         @Test func exceptionHandlerUsesRegistrar() {

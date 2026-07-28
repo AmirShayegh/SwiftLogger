@@ -1,0 +1,12 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/
+.netrc
+
+# Local code-review tooling artifacts
+reviews.db
+reviews.db-shm
+reviews.db-wal

@@ -207,7 +207,7 @@ let logger = Logger(label: "com.myapp.network")
 logger.info("request sent")
 ```
 
-Level mapping: trace -> verbose, debug -> debug, info -> info, notice -> info, warning -> warning, error -> error, critical -> todo. Metadata is bridged to `LogMetadata` with all values converted to strings.
+Level mapping: trace -> verbose, debug -> debug, info -> info, notice -> info, warning -> warning, error -> error, critical -> error. Metadata is bridged to `LogMetadata` with all values converted to strings — dictionary values are sorted by key for deterministic output, array values keep their original order.
 
 ## Thread Safety
 

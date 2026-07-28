@@ -89,7 +89,10 @@ public struct SwiftLogHandler: LogHandler {
         case .notice:   return .info
         case .warning:  return .warning
         case .error:    return .error
-        case .critical: return .todo
+        // `.todo` outranks `.error` in this library, but it renders as " TODO" —
+        // misleading for a crash-severity swift-log message. `.error` is the
+        // closest honest match.
+        case .critical: return .error
         }
     }
 
@@ -105,7 +108,9 @@ public struct SwiftLogHandler: LogHandler {
             let pairs = dict.map { "\($0.key)=\(mapMetadataValue($0.value))" }.sorted().joined(separator: ", ")
             return .string("{\(pairs)}")
         case .array(let arr):
-            let items = arr.map { "\(mapMetadataValue($0))" }.sorted().joined(separator: ", ")
+            // Arrays are ordered data — preserve element order. (Dictionaries above
+            // are unordered, so sorting there is what makes output deterministic.)
+            let items = arr.map { "\(mapMetadataValue($0))" }.joined(separator: ", ")
             return .string("[\(items)]")
         }
     }

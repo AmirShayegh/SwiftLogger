@@ -265,9 +265,11 @@ extension AllLoggerTests {
             Logger.shared.fileLogging(url: customURL, label: "custom")
 
             // Disabling the default file destination is scoped to the "file" label,
-            // so a differently-labelled custom destination must survive.
+            // so a differently-labelled custom destination must survive. The flag is
+            // label-scoped too, so it reports false here — survival is proven by the
+            // custom destination still receiving writes below.
             Logger.shared.fileLogging(false)
-            #expect(Logger.shared.isFileLoggingActive)
+            #expect(!Logger.shared.isFileLoggingActive)
 
             Logger.shared.log("survives default disable", level: .info)
 
@@ -301,12 +303,13 @@ extension AllLoggerTests {
             // default must add a "file" destination alongside it rather than silently
             // no-opping (the old type-based guard would have skipped creation).
             Logger.shared.fileLogging(true)
+            #expect(Logger.shared.isFileLoggingActive)
 
             // Disabling again removes only the "file" destination; the custom one is
             // left intact and still active. Under the old type-based behaviour this
             // removeAll would have destroyed the custom destination too.
             Logger.shared.fileLogging(false)
-            #expect(Logger.shared.isFileLoggingActive)
+            #expect(!Logger.shared.isFileLoggingActive)
 
             Logger.shared.log("custom survives round trip", level: .info)
 

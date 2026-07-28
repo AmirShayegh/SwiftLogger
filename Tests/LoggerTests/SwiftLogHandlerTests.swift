@@ -44,7 +44,17 @@ extension AllLoggerTests {
             #expect(SwiftLogHandler.mapLevel(.notice) == .info)
             #expect(SwiftLogHandler.mapLevel(.warning) == .warning)
             #expect(SwiftLogHandler.mapLevel(.error) == .error)
-            #expect(SwiftLogHandler.mapLevel(.critical) == .todo)
+            #expect(SwiftLogHandler.mapLevel(.critical) == .error)
+        }
+
+        @Test func arrayMetadataPreservesOrder() {
+            let value = SwiftLogHandler.mapMetadataValue(.array(["step10", "step2", "step1"]))
+            #expect(value.description == "[step10, step2, step1]")
+        }
+
+        @Test func dictionaryMetadataIsSortedForDeterminism() {
+            let value = SwiftLogHandler.mapMetadataValue(.dictionary(["b": "2", "a": "1"]))
+            #expect(value.description == "{a=1, b=2}")
         }
 
         @Test func metadataBridging() {

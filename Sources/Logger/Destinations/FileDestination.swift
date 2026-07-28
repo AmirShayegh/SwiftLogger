@@ -23,7 +23,6 @@ public final class FileDestination: @unchecked Sendable {
     private var currentFileSize: UInt64
     private let rotationConfig: FileRotationConfig?
     private let _minimumLevel: LogLevel?
-    private let _levelLock = NSLock()
 
     public init?(
         url: URL,
@@ -195,11 +194,7 @@ public final class FileDestination: @unchecked Sendable {
 extension FileDestination: LogDestination {
     public var isEnabled: Bool { true }
 
-    public var minimumLevel: LogLevel? {
-        _levelLock.lock()
-        defer { _levelLock.unlock() }
-        return _minimumLevel
-    }
+    public var minimumLevel: LogLevel? { _minimumLevel }
 
     public func write(_ entry: LogEntry) {
         let line = entry.format()
@@ -212,8 +207,15 @@ extension FileDestination: LogDestination {
     }
 
     public func flush() {
-        queue.sync { [self] in
+        let work = { [self] in
             try? self.fileHandle.synchronize()
+        }
+        // Same reasoning as `forceSave`: `queue.sync` from the queue's own thread
+        // would trap, so run inline when we are already on it.
+        if DispatchQueue.getSpecific(key: Self.queueKey) == true {
+            work()
+        } else {
+            queue.sync(execute: work)
         }
     }
 }

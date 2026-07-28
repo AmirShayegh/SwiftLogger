@@ -69,9 +69,4 @@ public final class ConsoleDestination: LogDestination, @unchecked Sendable {
         lock.unlock()
     }
 
-    internal func resetHighlights() {
-        lock.lock()
-        _highlightedFiles.removeAll()
-        lock.unlock()
-    }
 }
