@@ -55,13 +55,7 @@ public struct LogEntry: Sendable {
     }
 
     private static func formatTimestamp(_ date: Date) -> String {
-        let formatter = Thread.current.threadDictionary["LoggerDateFormatter"] as? DateFormatter ?? {
-            let f = DateFormatter()
-            f.dateFormat = "HH:mm:ss.SSS"
-            Thread.current.threadDictionary["LoggerDateFormatter"] = f
-            return f
-        }()
-        return formatter.string(from: date)
+        TimestampFormatter.string(from: date)
     }
 }
 
