@@ -1,5 +1,6 @@
 import Testing
 import Logging
+import Foundation
 @testable import Logger
 
 extension AllLoggerTests {
@@ -35,6 +36,153 @@ extension AllLoggerTests {
             #expect(mock.entries.count == 1)
             #expect(mock.entries[0].message == "hello from swift-log")
             #expect(mock.entries[0].subsystem == "com.test.module")
+        }
+
+        // MARK: - Pre-filtering
+
+        /// Counts how many times its `description` is read, so a test can prove
+        /// a filtered message never stringified it.
+        private final class CountingConvertible: CustomStringConvertible, @unchecked Sendable {
+            private let lock = NSLock()
+            private var _reads = 0
+            var reads: Int { lock.lock(); defer { lock.unlock() }; return _reads }
+            var description: String {
+                lock.lock(); _reads += 1; lock.unlock()
+                return "expensive"
+            }
+        }
+
+        private struct CountingError: Error, CustomStringConvertible {
+            let probe: CountingConvertible
+            var description: String { probe.description }
+        }
+
+        @Test func filteredBridgedMessageDoesNotBridgeMetadata() {
+            Logger.shared.consoleLogging(false)
+            Logger.shared.minimumLevel(.error)
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+            Logger.shared.setOutputSink { _ in }
+
+            let probe = CountingConvertible()
+            let handler = makeHandler(label: "bridge.filter")
+            handler.log(event: makeEvent(
+                level: .debug,
+                message: "filtered out",
+                metadata: ["expensive": .stringConvertible(probe)]
+            ))
+
+            #expect(mock.entries.isEmpty)
+            // The whole point: a message that will be discarded must not pay to
+            // convert its metadata first.
+            #expect(probe.reads == 0)
+        }
+
+        @Test func filteredBridgedMessageSkipsErrorStringification() {
+            Logger.shared.consoleLogging(false)
+            Logger.shared.minimumLevel(.error)
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+            Logger.shared.setOutputSink { _ in }
+
+            let probe = CountingConvertible()
+            var handler = makeHandler(label: "bridge.error")
+            handler.logLevel = .trace
+            handler.log(event: LogEvent(
+                level: .debug,
+                message: "filtered out",
+                error: CountingError(probe: probe),
+                metadata: nil,
+                source: nil,
+                file: "Test.swift",
+                function: "f()",
+                line: 1
+            ))
+
+            #expect(mock.entries.isEmpty)
+            #expect(probe.reads == 0)
+        }
+
+        @Test func passingBridgedMessageStillBridgesMetadataAndError() {
+            Logger.shared.consoleLogging(false)
+            Logger.shared.minimumLevel(.debug)
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+            Logger.shared.setOutputSink { _ in }
+
+            let handler = makeHandler(label: "bridge.pass")
+            handler.log(event: LogEvent(
+                level: .warning,
+                message: "kept",
+                error: SampleError(),
+                metadata: ["k": "v"],
+                source: nil,
+                file: "Test.swift",
+                function: "f()",
+                line: 1
+            ))
+
+            #expect(mock.entries.count == 1)
+            let metadata = mock.entries[0].metadata
+            #expect(metadata?["k"]?.description == "v")
+            #expect(metadata?["error"]?.description == "sample-error-detail")
+        }
+
+        @Test func preFilterRespectsSubsystemLevelsNotJustTheGlobalMinimum() {
+            Logger.shared.consoleLogging(false)
+            // Global minimum would reject .debug, but the subsystem level — which
+            // is the swift-log label — permits it. A pre-filter that only
+            // consulted the global minimum would wrongly drop this.
+            Logger.shared.minimumLevel(.error).subsystem("chatty.module", level: .debug)
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+            Logger.shared.setOutputSink { _ in }
+
+            let handler = makeHandler(label: "chatty.module")
+            handler.log(event: makeEvent(level: .debug, message: "kept", metadata: ["k": "v"]))
+
+            #expect(mock.entries.count == 1)
+            #expect(mock.entries[0].message == "kept")
+        }
+
+        @Test func wouldLogAgreesWithLogMessageGate() {
+            Logger.shared.consoleLogging(false)
+            Logger.shared.setOutputSink { _ in }
+            Logger.shared
+                .minimumLevel(.info)
+                .subsystem("net", level: .warning)
+                .subsystem("net.debug", level: .verbose)
+                .logLevel(.error, forFile: "Loud.swift")
+
+            let mock = MockDestination()
+            Logger.shared.addDestination(mock)
+
+            let levels: [LogLevel] = [.verbose, .debug, .info, .warning, .error, .todo]
+            let subsystems: [String?] = [nil, "net", "net.debug", "net.http", "other"]
+            let files = ["Quiet.swift", "Loud.swift", "Module/Loud.swift"]
+
+            // wouldLog is a second implementation of the same gate, so it is
+            // checked against the ground truth — whether the message actually
+            // reached a destination — for every combination. This is what keeps
+            // the two from drifting apart later.
+            for level in levels {
+                for subsystem in subsystems {
+                    for file in files {
+                        let predicted = Logger.shared.wouldLog(
+                            level: level, subsystem: subsystem, file: file
+                        )
+                        let before = mock.entries.count
+                        Logger.shared.logMessage(
+                            { "probe" }, level: level, subsystem: subsystem, file: file
+                        )
+                        let actuallyLogged = mock.entries.count > before
+                        #expect(
+                            predicted == actuallyLogged,
+                            "level \(level) subsystem \(subsystem ?? "nil") file \(file)"
+                        )
+                    }
+                }
+            }
         }
 
         @Test func levelMappingCoversAllSwiftLogLevels() {

@@ -54,6 +54,18 @@ public struct SwiftLogHandler: LogHandler {
     public func log(event: LogEvent) {
         let ourLevel = Self.mapLevel(event.level)
 
+        // Bridging metadata means merging dictionaries, stringifying an
+        // attached error, and converting every value — all of it wasted if the
+        // pipeline is going to discard the message. Check the gate first, but
+        // only when there is actually context to build: with no metadata and no
+        // error there is nothing to save, and logMessage's own gate is cheaper
+        // than a second resolution.
+        let hasContextToBuild = !metadata.isEmpty || event.metadata != nil || event.error != nil
+        if hasContextToBuild,
+           !logger.wouldLog(level: ourLevel, subsystem: label, file: event.file) {
+            return
+        }
+
         var merged = self.metadata
         if let extra = event.metadata {
             merged.merge(extra, uniquingKeysWith: { _, new in new })

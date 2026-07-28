@@ -437,17 +437,7 @@ public final class Logger: @unchecked Sendable {
         // never needs it. Resolve the level with the cheapest sufficient
         // information: a subsystem level wins outright, and per-file lookup only
         // happens when overrides actually exist.
-        var fileName: String? = nil
-        let effectiveLevel: LogLevel
-        if let subsystemLevel = subsystem.flatMap({ config.resolveSubsystemLevel($0) }) {
-            effectiveLevel = subsystemLevel
-        } else if config.hasFileLevelOverrides {
-            let name = Self.lastPathComponent(of: file)
-            fileName = name
-            effectiveLevel = config.fileLogLevels[name] ?? config.minimumLogLevel
-        } else {
-            effectiveLevel = config.minimumLogLevel
-        }
+        let (effectiveLevel, fileName) = config.resolveEffectiveLevel(subsystem: subsystem, file: file)
 
         guard level >= effectiveLevel else { return }
 
@@ -486,9 +476,25 @@ public final class Logger: @unchecked Sendable {
     /// and callers may pass a full `#file` path; both reduce to the trailing
     /// segment. Avoids the `NSString` bridge this used to pay on every call.
     @inline(__always)
-    private static func lastPathComponent(of path: String) -> String {
+    internal static func lastPathComponent(of path: String) -> String {
         guard let slash = path.lastIndex(of: "/") else { return path }
         return String(path[path.index(after: slash)...])
+    }
+
+    /// Whether a message at `level` from `subsystem`/`file` would pass the
+    /// level gate.
+    ///
+    /// Lets a bridge skip building context — stringifying errors, converting
+    /// metadata dictionaries — for a message that is about to be discarded. It
+    /// takes the raw `file` rather than a pre-derived name on purpose: deriving
+    /// one eagerly would reintroduce exactly the string scan the hot path goes
+    /// out of its way to defer.
+    ///
+    /// This is only the *level* gate, the same one ``logMessage`` applies
+    /// first; a message that passes here can still be dropped by every
+    /// destination's own minimum.
+    internal func wouldLog(level: LogLevel, subsystem: String?, file: String) -> Bool {
+        level >= config.resolveEffectiveLevel(subsystem: subsystem, file: file).level
     }
 
     // MARK: - Exception Handling

@@ -105,6 +105,28 @@ internal final class LoggerConfiguration: @unchecked Sendable {
         return resolved
     }
 
+    /// Resolves the level a message must meet, and — only when it had to derive
+    /// one — the file name it derived.
+    ///
+    /// Returning the derived name lets the caller reuse it for the `LogEntry`
+    /// instead of scanning `#fileID` a second time. Deriving it is deliberately
+    /// skipped when a subsystem level answers the question or no per-file
+    /// overrides exist, which is the overwhelmingly common case.
+    @inline(__always)
+    func resolveEffectiveLevel(
+        subsystem: String?,
+        file: String
+    ) -> (level: LogLevel, derivedFileName: String?) {
+        if let subsystem, let subsystemLevel = resolveSubsystemLevel(subsystem) {
+            return (subsystemLevel, nil)
+        }
+        if hasFileLevelOverrides {
+            let name = Logger.lastPathComponent(of: file)
+            return (fileLogLevels[name] ?? minimumLogLevel, name)
+        }
+        return (minimumLogLevel, nil)
+    }
+
     private func walkSubsystemHierarchy(_ name: String) -> LogLevel? {
         var current = name
         while true {
