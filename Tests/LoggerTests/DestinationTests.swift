@@ -424,18 +424,11 @@ extension AllLoggerTests {
             defer { try? FileManager.default.removeItem(at: tmp) }
             let customURL = tmp.appendingPathComponent("custom.log")
 
-            // fileLogging(true) writes the default destination to the real
-            // ~/Library/Logs/app.log. Track whether it pre-existed so we can remove
-            // any empty file we create and keep the test hermetic.
-            let defaultURL = FileManager.default
-                .urls(for: .libraryDirectory, in: .userDomainMask).first?
-                .appendingPathComponent("Logs/app.log")
-            let defaultExistedBefore = defaultURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? true
-            defer {
-                if let defaultURL, !defaultExistedBefore {
-                    try? FileManager.default.removeItem(at: defaultURL)
-                }
-            }
+            // Redirect the default destination into this test's temp directory
+            // rather than the developer's real ~/Library/Logs/app.log.
+            let defaultURL = tmp.appendingPathComponent("default.log")
+            Logger.defaultFileURLOverride = defaultURL
+            defer { Logger.defaultFileURLOverride = nil }
 
             Logger.shared.consoleLogging(false)
             Logger.shared.fileLogging(url: customURL, label: "custom")
@@ -445,6 +438,7 @@ extension AllLoggerTests {
             // no-opping (the old type-based guard would have skipped creation).
             Logger.shared.fileLogging(true)
             #expect(Logger.shared.isFileLoggingActive)
+            #expect(FileManager.default.fileExists(atPath: defaultURL.path))
 
             // Disabling again removes only the "file" destination; the custom one is
             // left intact and still active. Under the old type-based behaviour this

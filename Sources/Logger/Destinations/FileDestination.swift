@@ -218,14 +218,10 @@ public final class FileDestination: @unchecked Sendable {
         )
     }
 
+    /// The destination `Logger.fileLogging(true)` creates: `Library/Logs/app.log`,
+    /// or whatever ``Logger/defaultFileURLOverride`` names.
     internal convenience init?() {
-        let logsDir: URL
-        if let lib = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first {
-            logsDir = lib.appendingPathComponent("Logs")
-        } else {
-            logsDir = FileManager.default.temporaryDirectory
-        }
-        self.init(url: logsDir.appendingPathComponent("app.log"))
+        self.init(url: Logger.defaultFileURL)
     }
 
     deinit {

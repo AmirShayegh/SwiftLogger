@@ -73,6 +73,33 @@ public final class Logger: @unchecked Sendable {
     /// Label identifying the console destination.
     private static let consoleLabel = "console"
 
+    /// Redirects the destination created by ``fileLogging(_:)``, for tests that
+    /// would otherwise write to the developer's real `~/Library/Logs/app.log`.
+    ///
+    /// Guarded by its own lock, deliberately not `writeLock`: it is read from
+    /// `FileDestination.init()` inside a `mutateConfig` transform, which already
+    /// holds `writeLock`. Reusing it here would deadlock on the first
+    /// `fileLogging(true)`.
+    private static let defaultFileURLLock = UnfairLock()
+    private nonisolated(unsafe) static var _defaultFileURLOverride: URL?
+
+    internal static var defaultFileURLOverride: URL? {
+        get { defaultFileURLLock.withLock { _defaultFileURLOverride } }
+        set { defaultFileURLLock.withLock { _defaultFileURLOverride = newValue } }
+    }
+
+    /// Where ``fileLogging(_:)`` writes.
+    internal static var defaultFileURL: URL {
+        if let override = defaultFileURLOverride { return override }
+        let logsDir: URL
+        if let lib = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first {
+            logsDir = lib.appendingPathComponent("Logs")
+        } else {
+            logsDir = FileManager.default.temporaryDirectory
+        }
+        return logsDir.appendingPathComponent("app.log")
+    }
+
     private var config: LoggerConfiguration {
         configLock.withLock { _config }
     }
@@ -603,6 +630,8 @@ public final class Logger: @unchecked Sendable {
         _installRegistrar = nil
         exceptionHandlerRegistrar = Self.defaultRegistrar
         writeLock.unlock()
+
+        Self.defaultFileURLOverride = nil
 
         // Outside the lock: the registrar is caller-supplied, and the drain and
         // release below run the user's formatter, which may reconfigure the

@@ -89,11 +89,32 @@ struct AllLoggerTests {
             #expect(messages[0].contains("noisy debug again"))
         }
 
+        /// Points `fileLogging(true)` at a throwaway file for the duration of
+        /// `body`, so tests never touch the developer's real
+        /// `~/Library/Logs/app.log`.
+        private func withDefaultFileRedirected(_ body: (URL) throws -> Void) rethrows {
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("logger-default-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            Logger.defaultFileURLOverride = dir.appendingPathComponent("app.log")
+            defer {
+                Logger.defaultFileURLOverride = nil
+                try? FileManager.default.removeItem(at: dir)
+            }
+            try body(dir.appendingPathComponent("app.log"))
+        }
+
         @Test func fileLoggingReportsActiveState() {
-            #expect(!Logger.shared.isFileLoggingActive)
-            Logger.shared.fileLogging(true)
-            Logger.shared.fileLogging(false)
-            #expect(!Logger.shared.isFileLoggingActive)
+            withDefaultFileRedirected { url in
+                #expect(!Logger.shared.isFileLoggingActive)
+                Logger.shared.fileLogging(true)
+                #expect(Logger.shared.isFileLoggingActive)
+                // The override is load-bearing, not decoration: the default
+                // destination must have opened *this* file.
+                #expect(FileManager.default.fileExists(atPath: url.path))
+                Logger.shared.fileLogging(false)
+                #expect(!Logger.shared.isFileLoggingActive)
+            }
         }
 
         @Test func isFileLoggingActiveIgnoresCustomLabelledFileDestinations() throws {
@@ -106,8 +127,10 @@ struct AllLoggerTests {
             Logger.shared.fileLogging(url: url, label: "crashlog")
             #expect(!Logger.shared.isFileLoggingActive)
 
-            Logger.shared.fileLogging(true)
-            #expect(Logger.shared.isFileLoggingActive)
+            withDefaultFileRedirected { _ in
+                Logger.shared.fileLogging(true)
+                #expect(Logger.shared.isFileLoggingActive)
+            }
 
             // Disabling the default leaves the custom destination in place.
             Logger.shared.fileLogging(false)
