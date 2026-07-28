@@ -290,6 +290,66 @@ extension AllLoggerTests {
             }
         }
 
+        @Test func reentrantFormatterDoesNotAbortTheDroppedNotice() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("reentrant.log")
+
+            // A formatter that logs back into its own destination — user
+            // formatters do this for diagnostics. The drop notice is rendered
+            // with the user formatter, and rendering it under the non-recursive
+            // stateLock would abort the process the moment the formatter
+            // re-entered write().
+            final class ChattyFormatter: LogFormatter, @unchecked Sendable {
+                weak var destination: FileDestination?
+                func format(_ entry: LogEntry) -> String {
+                    if entry.message.contains("dropped") {
+                        destination?.write(LogEntry(level: .debug, message: "formatter side-effect"))
+                    }
+                    return entry.message
+                }
+            }
+
+            let formatter = ChattyFormatter()
+            let fd = FileDestination(
+                url: url,
+                formatter: formatter,
+                tunables: .init(maxBufferedEntries: 2, flushInterval: 600, flushByteThreshold: 1_000_000)
+            )!
+            formatter.destination = fd
+
+            for i in 0..<4 { fd.write(LogEntry(level: .info, message: "kept \(i)")) }
+            fd.flush()
+
+            let content = contents(of: url)
+            #expect(content.contains("dropped 2 messages"))
+        }
+
+        @Test func writeFailureIsCountedAsDropped() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("failing.log")
+
+            let fd = FileDestination(
+                url: url,
+                tunables: .init(flushInterval: 600, flushByteThreshold: 1_000_000)
+            )!
+
+            fd.write(LogEntry(level: .info, message: "casualty"))
+            fd.closeHandleForTesting()
+            fd.flush()  // The write fails; the entry is lost but must be counted.
+
+            // forceSave's crash path reopens immediately, recovering the handle;
+            // the next flush then reports the loss.
+            fd.forceSave("CRASH")
+            fd.flush()
+
+            let content = contents(of: url)
+            #expect(!content.contains("casualty"))
+            #expect(content.contains("CRASH"))
+            #expect(content.contains("dropped 1 message —"))
+        }
+
         @Test func rotationThresholdClampsTheBufferSize() throws {
             let dir = try makeTempDir()
             defer { try? FileManager.default.removeItem(at: dir) }

@@ -215,23 +215,31 @@ public final class FileDestination: @unchecked Sendable {
         // held `self` strongly for its duration and has already drained, and this
         // block captures only the handle and the leftover bytes — never `self`.
         let handle = fileHandle
-        let remaining = stateLock.withLock { () -> Data in
+        let (chunk, dropped) = stateLock.withLock { () -> (Data, Int) in
             scheduledFlush?.cancel()
             scheduledFlush = nil
 
             scheduledFlushIsImmediate = false
-            var data = pending
-            if droppedCount > 0 {
-                data.append(droppedNoticeData(count: droppedCount))
-                droppedCount = 0
-            }
+            let data = pending
+            let droppedNow = droppedCount
+            droppedCount = 0
             pending = Data()
             pendingCount = 0
-            return data
+            return (data, droppedNow)
+        }
+
+        // The drop notice is rendered outside stateLock — the formatter is
+        // user code (see performFlush).
+        var remaining = chunk
+        if dropped > 0 {
+            remaining.append(droppedNoticeData(count: dropped))
         }
 
         queue.async {
             if !remaining.isEmpty {
+                // Last chance: the destination is going away, so a write
+                // failure here has no counter left to report into. try? is
+                // deliberate.
                 try? handle.write(contentsOf: remaining)
             }
             try? handle.synchronize()
@@ -247,8 +255,17 @@ public final class FileDestination: @unchecked Sendable {
             // Drain anything buffered first so the crash log lands after the
             // entries that led up to it rather than jumping ahead of them.
             self.performFlush()
-            try? self.fileHandle.write(contentsOf: data)
-            self.currentFileSize += UInt64(data.count)
+            do {
+                try self.fileHandle.write(contentsOf: data)
+                self.currentFileSize += UInt64(data.count)
+            } catch {
+                // Crash path: there is no later flush to defer to, so retry
+                // once through a fresh handle immediately.
+                self.reopenOrFail()
+                if (try? self.fileHandle.write(contentsOf: data)) != nil {
+                    self.currentFileSize += UInt64(data.count)
+                }
+            }
             try? self.fileHandle.synchronize()
         }
         if DispatchQueue.getSpecific(key: Self.queueKey) == true {
@@ -322,28 +339,61 @@ public final class FileDestination: @unchecked Sendable {
 
     /// Writes the buffered bytes. Runs only on the serial queue.
     private func performFlush() {
-        let chunk = stateLock.withLock { () -> Data in
+        let (chunk, batchCount, dropped) = stateLock.withLock { () -> (Data, Int, Int) in
             // Clearing `scheduledFlush` before the write means a `write()` racing
             // with it schedules a fresh flush, which the serial queue runs after
             // this one. Clearing it afterwards could lose that wakeup.
             scheduledFlush = nil
 
             scheduledFlushIsImmediate = false
-            var data = pending
-            if droppedCount > 0 {
-                data.append(droppedNoticeData(count: droppedCount))
-                droppedCount = 0
-            }
+            let data = pending
+            let count = pendingCount
+            let droppedNow = droppedCount
+            droppedCount = 0
             pending = Data()
             pendingCount = 0
-            return data
+            return (data, count, droppedNow)
         }
 
-        guard !chunk.isEmpty else { return }
+        guard !chunk.isEmpty || dropped > 0 else { return }
 
-        try? fileHandle.write(contentsOf: chunk)
-        currentFileSize += UInt64(chunk.count)
-        rotateIfNeeded()
+        // The drop notice is rendered outside stateLock: the formatter is user
+        // code and may log back into this destination, and re-entering the
+        // non-recursive stateLock would abort the process.
+        var payload = chunk
+        if dropped > 0 {
+            payload.append(droppedNoticeData(count: dropped))
+        }
+
+        do {
+            try fileHandle.write(contentsOf: payload)
+            currentFileSize += UInt64(payload.count)
+            rotateIfNeeded()
+        } catch {
+            // The bytes are gone — count them as dropped so the next
+            // successful flush reports the loss. Deliberately not re-prepended
+            // to the buffer: a persistent outage (ENOSPC lasts seconds to
+            // minutes) would rewrite the buffer head on every retry for the
+            // same net loss.
+            recordWriteFailure(batchCount + dropped)
+        }
+    }
+
+    /// Folds a failed write's entries into the dropped count so the next
+    /// successful flush reports them.
+    private func recordWriteFailure(_ lost: Int) {
+        guard lost > 0 else { return }
+        stateLock.withLock { droppedCount += lost }
+    }
+
+    // MARK: - Test Support
+
+    /// Closes the underlying handle so the next write fails, simulating a dead
+    /// descriptor (revoked file, ENOSPC-style outage) without needing one.
+    internal func closeHandleForTesting() {
+        queue.sync {
+            try? fileHandle.close()
+        }
     }
 
     // MARK: - Rotation (runs exclusively on serial queue)
