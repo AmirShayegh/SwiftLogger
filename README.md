@@ -97,7 +97,7 @@ let io       = pipeline.scoped(correlation: "io-1", subsystem: "io") // override
 A scope can also carry default metadata, merged into every message it emits. Per-call metadata wins on key collisions, so a message reporting a specific state is never masked by the scope's default.
 
 ```swift
-let session = Log.scoped(correlation: "s-1", metadata: ["user": userID, "state": "running"])
+let session = Log.scoped(correlation: "s-1", metadata: ["user": LogValue(userID), "state": "running"])
 session.info("started")                            // {state=running, user=…}
 session.error("failed", metadata: ["state": "failed"])  // {state=failed, user=…}
 ```
@@ -115,6 +115,18 @@ Type-safe key-value pairs via `LogValue`. Supports string, integer, float, and b
 
 ```swift
 Log("request done", metadata: ["status": 200, "cached": false, "ms": 142.5, "path": "/home"])
+```
+
+Those are *literals*. Swift does not convert implicitly, so a value held in a variable is wrapped explicitly:
+
+```swift
+Log("request done", metadata: ["status": LogValue(statusCode), "path": LogValue(path)])
+```
+
+String interpolation works too, and produces a `.string`:
+
+```swift
+Log("request done", metadata: ["status": "\(statusCode)"])
 ```
 
 Metadata keys are sorted alphabetically in the output.

@@ -473,6 +473,55 @@ struct AllLoggerTests {
             Logger.shared.consoleLogging(false)
         }
 
+        @Test func logValueInitializersWrapRuntimeValues() {
+            // The literal conformances cannot help here: these are variables,
+            // and Swift performs no implicit conversion. Without these inits
+            // the only spelling is `.string(name)`, which leaks the case names
+            // into every call site.
+            let name = "amir"
+            let count = 7
+            let ratio = 0.25
+            let flag = true
+
+            #expect(LogValue(name).description == "amir")
+            #expect(LogValue(count).description == "7")
+            #expect(LogValue(ratio).description == "0.25")
+            #expect(LogValue(flag).description == "true")
+
+            let metadata: LogMetadata = [
+                "name": LogValue(name),
+                "count": LogValue(count),
+                "flag": LogValue(flag)
+            ]
+            #expect(metadata["count"]?.description == "7")
+        }
+
+        @Test func logValueUnlabeledInitPicksExpectedCaseForLiterals() {
+            // Passing a literal to the unlabeled init must not become ambiguous
+            // with the ExpressibleBy* conformances. Integer literals default to
+            // Int, float literals to Double.
+            func caseName(_ value: LogValue) -> String {
+                switch value {
+                case .string: return "string"
+                case .int: return "int"
+                case .double: return "double"
+                case .bool: return "bool"
+                }
+            }
+
+            #expect(caseName(LogValue(5)) == "int")
+            #expect(caseName(LogValue(5.0)) == "double")
+            #expect(caseName(LogValue("5")) == "string")
+            #expect(caseName(LogValue(false)) == "bool")
+
+            // Dictionary literals still take the literal path, unchanged.
+            let literals: LogMetadata = ["a": 1, "b": 1.5, "c": "x", "d": true]
+            #expect(caseName(literals["a"]!) == "int")
+            #expect(caseName(literals["b"]!) == "double")
+            #expect(caseName(literals["c"]!) == "string")
+            #expect(caseName(literals["d"]!) == "bool")
+        }
+
         @Test func logWithMetadataFormatsCorrectly() {
             var messages: [String] = []
             Logger.shared.setOutputSink { messages.append($0) }

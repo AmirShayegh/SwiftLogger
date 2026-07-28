@@ -421,7 +421,7 @@ public final class Logger: @unchecked Sendable {
     ///
     /// Pass `metadata` to attach context to every message from the scope:
     ///
-    ///     let session = Log.scoped(correlation: "s-1", metadata: ["user": userID])
+    ///     let session = Log.scoped(correlation: "s-1", metadata: ["user": LogValue(userID)])
     public func scoped(
         correlation: String,
         subsystem: String? = nil,

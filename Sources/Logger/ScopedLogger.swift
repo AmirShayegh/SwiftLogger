@@ -12,7 +12,7 @@ import Foundation
 ///
 /// A scope can also carry default metadata, merged into every message it emits:
 ///
-///     let job = Log.scoped(correlation: "job-\(id)", metadata: ["user": userID])
+///     let job = Log.scoped(correlation: "job-\(id)", metadata: ["user": LogValue(userID)])
 ///     job.info("started")                              // includes user=…
 ///     job.info("done", metadata: ["ms": elapsed])      // includes user=… and ms=…
 ///
