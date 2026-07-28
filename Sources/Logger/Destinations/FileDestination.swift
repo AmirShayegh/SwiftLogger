@@ -23,6 +23,9 @@ public final class FileDestination: @unchecked Sendable {
     private let rotationConfig: FileRotationConfig?
     private let _minimumLevel: LogLevel?
 
+    /// Renders each entry. Immutable, so it needs no lock.
+    public let formatter: any LogFormatter
+
     // MARK: - Serial-queue-only state
     //
     // `fileHandle`, `currentFileSize`, and everything rotation touches are read
@@ -61,12 +64,14 @@ public final class FileDestination: @unchecked Sendable {
         url: URL,
         label: String = "file",
         minimumLevel: LogLevel? = nil,
-        rotationConfig: FileRotationConfig? = nil
+        rotationConfig: FileRotationConfig? = nil,
+        formatter: any LogFormatter = DefaultLogFormatter()
     ) {
         self.label = label
         self.fileURL = url
         self._minimumLevel = minimumLevel
         self.rotationConfig = rotationConfig
+        self.formatter = formatter
 
         if !FileManager.default.fileExists(atPath: url.path) {
             let dir = url.deletingLastPathComponent()
@@ -119,7 +124,7 @@ public final class FileDestination: @unchecked Sendable {
             scheduledFlushIsImmediate = false
             var data = pending
             if droppedCount > 0 {
-                data.append(Self.droppedNoticeData(count: droppedCount))
+                data.append(droppedNoticeData(count: droppedCount))
                 droppedCount = 0
             }
             pending = Data()
@@ -157,13 +162,15 @@ public final class FileDestination: @unchecked Sendable {
 
     // MARK: - Buffering
 
-    private static func droppedNoticeData(count: Int) -> Data {
+    private func droppedNoticeData(count: Int) -> Data {
         let entry = LogEntry(
             level: .warning,
             message: "[Logger] dropped \(count) message\(count == 1 ? "" : "s") — write buffer full",
             fileName: "FileDestination.swift"
         )
-        return Data((entry.format() + "\n").utf8)
+        // Rendered with this destination's formatter so the notice is parseable
+        // by whatever reads the rest of the file.
+        return Data((formatter.format(entry) + "\n").utf8)
     }
 
     /// Appends `data` to the buffer and makes sure a flush is on its way.
@@ -226,7 +233,7 @@ public final class FileDestination: @unchecked Sendable {
             scheduledFlushIsImmediate = false
             var data = pending
             if droppedCount > 0 {
-                data.append(Self.droppedNoticeData(count: droppedCount))
+                data.append(droppedNoticeData(count: droppedCount))
                 droppedCount = 0
             }
             pending = Data()
@@ -349,7 +356,7 @@ extension FileDestination: LogDestination {
     /// Buffers the entry. Formatting happens on the calling thread; the write
     /// itself is coalesced with neighbouring entries onto the serial queue.
     public func write(_ entry: LogEntry) {
-        enqueue(Data((entry.format() + "\n").utf8))
+        enqueue(Data((formatter.format(entry) + "\n").utf8))
     }
 
     /// Drains the buffer and forces it to storage before returning.

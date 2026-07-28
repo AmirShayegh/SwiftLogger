@@ -144,6 +144,32 @@ Log("verbose detail", level: .debug)   // console only
 Log("disk-worthy warning", level: .warning) // both
 ```
 
+### Formatters
+
+Destinations take a `LogFormatter`, so the same entry can be human-readable on the console and machine-parseable on disk.
+
+```swift
+Log.addDestination(ConsoleDestination())                          // DefaultLogFormatter
+   .fileLogging(url: logURL, formatter: JSONLogFormatter())       // one JSON object per line
+```
+
+| Formatter | Output |
+|---|---|
+| `DefaultLogFormatter` | `LEVEL \| HH:mm:ss.SSS \| File.swift:42 \| [correlation] [subsystem] message {key=value}` |
+| `JSONLogFormatter` | `{"timestamp":"2026-07-27T12:15:30.842Z","level":"INFO","message":"...","line":42}` |
+
+`JSONLogFormatter` writes one self-contained JSON object per line (JSON Lines). Keys are emitted in a fixed order so output diffs cleanly, absent optionals are omitted rather than written as `null`, and metadata values keep their JSON types -- `LogValue.int` becomes a number, `.bool` a boolean. Pass `JSONLogFormatter(timestampStyle: .epochSeconds)` for numeric timestamps.
+
+Write your own by conforming to the protocol:
+
+```swift
+struct LogfmtFormatter: LogFormatter {
+    func format(_ entry: LogEntry) -> String {
+        "level=\(entry.level.rawValue) msg=\"\(entry.message)\" line=\(entry.line)"
+    }
+}
+```
+
 ### Built-in Destinations
 
 | Destination | Label | Description |

@@ -8,8 +8,12 @@ public final class ConsoleDestination: LogDestination, @unchecked Sendable {
     private var _highlightedFiles: Set<String> = []
     private var _minimumLevel: LogLevel?
 
-    public init(minimumLevel: LogLevel? = nil) {
+    /// Renders each entry. Immutable, so it needs no lock.
+    public let formatter: any LogFormatter
+
+    public init(minimumLevel: LogLevel? = nil, formatter: any LogFormatter = DefaultLogFormatter()) {
         self._minimumLevel = minimumLevel
+        self.formatter = formatter
     }
 
     public var isEnabled: Bool {
@@ -31,7 +35,7 @@ public final class ConsoleDestination: LogDestination, @unchecked Sendable {
     }
 
     public func write(_ entry: LogEntry) {
-        var line = entry.format()
+        var line = formatter.format(entry)
 
         lock.lock()
         let highlighted = _highlightedFiles.contains(entry.fileName)

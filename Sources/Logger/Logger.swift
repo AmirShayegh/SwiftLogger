@@ -164,7 +164,8 @@ public final class Logger: @unchecked Sendable {
         url: URL,
         label: String = "file",
         minimumLevel: LogLevel? = nil,
-        rotation: FileRotationConfig? = nil
+        rotation: FileRotationConfig? = nil,
+        formatter: any LogFormatter = DefaultLogFormatter()
     ) -> Logger {
         var openFailed = false
         mutateConfig { current in
@@ -172,7 +173,8 @@ public final class Logger: @unchecked Sendable {
                 url: url,
                 label: label,
                 minimumLevel: minimumLevel,
-                rotationConfig: rotation
+                rotationConfig: rotation,
+                formatter: formatter
             ) else {
                 openFailed = true
                 return current
