@@ -543,14 +543,18 @@ public final class FileDestination: @unchecked Sendable {
 
     /// Replaces `url` with a gzipped `url.gz`, leaving the original in place if
     /// compression fails — a bigger archive beats a lost one.
+    ///
+    /// Runs on the write queue like the rest of rotation. Streaming keeps the
+    /// stall proportional to disk read speed rather than to a whole-file
+    /// buffer, and staying on the queue keeps rotation, pruning, reopen, and
+    /// the deinit drain strictly ordered against each other — moving it off
+    /// would mean pruning could race a half-written archive and a destination
+    /// deallocated mid-compression could strand one.
     private func compressArchive(at url: URL) {
         #if canImport(Compression)
-        guard let raw = try? Data(contentsOf: url) else { return }
-        guard let gzipped = Gzip.compress(raw) else { return }
-
         let compressedURL = URL(fileURLWithPath: url.path + ".gz")
+        guard Gzip.compressFile(at: url, to: compressedURL) else { return }
         do {
-            try gzipped.write(to: compressedURL)
             try FileManager.default.removeItem(at: url)
         } catch {
             try? FileManager.default.removeItem(at: compressedURL)

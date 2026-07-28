@@ -10,15 +10,16 @@ import Compression
 /// gzip header and the trailing CRC-32 and length ourselves.
 internal enum Gzip {
 
+    /// Header: magic, DEFLATE method, no flags, no mtime, no extra flags, and
+    /// an unknown OS (255) so the output is reproducible.
+    private static let header: [UInt8] = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff]
+
     /// Returns `data` as a gzip stream, or `nil` if compression fails.
     static func compress(_ data: Data) -> Data? {
         guard let deflated = deflate(data) else { return nil }
 
         var output = Data(capacity: deflated.count + 18)
-
-        // Header: magic, DEFLATE method, no flags, no mtime, no extra flags,
-        // and an unknown OS (255) so the output is reproducible.
-        output.append(contentsOf: [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff])
+        output.append(contentsOf: header)
         output.append(deflated)
 
         // Trailer: CRC-32 of the *uncompressed* data, then its length mod 2^32,
@@ -27,6 +28,102 @@ internal enum Gzip {
         appendLittleEndian(&output, UInt32(truncatingIfNeeded: data.count))
 
         return output
+    }
+
+    /// Size of each read from the source file. Two of these are live at a time,
+    /// so peak memory is bounded regardless of how large the archive is.
+    private static let chunkSize = 64 * 1024
+
+    /// Compresses the file at `source` into a gzip file at `destination`,
+    /// streaming in fixed-size chunks.
+    ///
+    /// ``compress(_:)`` holds the whole input, the whole DEFLATE output, and
+    /// the assembled container in memory at once — roughly 2.5× a 10 MB archive
+    /// on the write queue. This reads and deflates incrementally instead, so a
+    /// rotation costs two 64 KB buffers no matter how big the log grew.
+    ///
+    /// Returns `false` and removes any partial output if anything fails, so the
+    /// caller can keep the uncompressed original.
+    static func compressFile(at source: URL, to destination: URL) -> Bool {
+        guard let input = try? FileHandle(forReadingFrom: source) else { return false }
+        defer { try? input.close() }
+
+        guard FileManager.default.createFile(atPath: destination.path, contents: nil),
+              let output = try? FileHandle(forWritingTo: destination) else {
+            try? FileManager.default.removeItem(at: destination)
+            return false
+        }
+
+        var succeeded = false
+        defer {
+            try? output.close()
+            if !succeeded {
+                try? FileManager.default.removeItem(at: destination)
+            }
+        }
+
+        guard (try? output.write(contentsOf: Data(header))) != nil else { return false }
+
+        var stream = compression_stream(
+            dst_ptr: UnsafeMutablePointer<UInt8>(bitPattern: -1)!, dst_size: 0,
+            src_ptr: UnsafePointer<UInt8>(bitPattern: -1)!, src_size: 0,
+            state: nil
+        )
+        guard compression_stream_init(&stream, COMPRESSION_STREAM_ENCODE, COMPRESSION_ZLIB)
+                == COMPRESSION_STATUS_OK else { return false }
+        defer { compression_stream_destroy(&stream) }
+
+        let outputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
+        defer { outputBuffer.deallocate() }
+
+        var crc: UInt32 = 0xFFFF_FFFF
+        var totalRead = 0
+
+        while true {
+            let chunk = (try? input.read(upToCount: chunkSize)) ?? Data()
+            let isLast = chunk.isEmpty
+            totalRead += chunk.count
+            crc = crc32Update(crc, chunk)
+
+            let ok = chunk.withUnsafeBytes { raw -> Bool in
+                // An empty Data has no base address; the encoder accepts a
+                // zero-length source as long as the pointer is non-null.
+                let base = raw.bindMemory(to: UInt8.self).baseAddress
+                    ?? UnsafePointer<UInt8>(bitPattern: -1)!
+                stream.src_ptr = base
+                stream.src_size = chunk.count
+                let flags = isLast ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
+
+                // One source chunk can expand into several output chunks, so
+                // keep draining until the encoder stops filling the buffer.
+                repeat {
+                    stream.dst_ptr = outputBuffer
+                    stream.dst_size = chunkSize
+                    let status = compression_stream_process(&stream, flags)
+                    guard status != COMPRESSION_STATUS_ERROR else { return false }
+
+                    let produced = chunkSize - stream.dst_size
+                    if produced > 0 {
+                        let out = Data(bytes: outputBuffer, count: produced)
+                        guard (try? output.write(contentsOf: out)) != nil else { return false }
+                    }
+                    if status == COMPRESSION_STATUS_END { break }
+                } while stream.src_size > 0 || (isLast && stream.dst_size == 0)
+
+                return true
+            }
+            guard ok else { return false }
+            if isLast { break }
+        }
+
+        // Trailer: CRC-32 of the uncompressed bytes, then their length mod 2^32.
+        var trailer = Data(capacity: 8)
+        appendLittleEndian(&trailer, crc ^ 0xFFFF_FFFF)
+        appendLittleEndian(&trailer, UInt32(truncatingIfNeeded: totalRead))
+        guard (try? output.write(contentsOf: trailer)) != nil else { return false }
+
+        succeeded = true
+        return true
     }
 
     private static func appendLittleEndian(_ data: inout Data, _ value: UInt32) {
@@ -69,13 +166,21 @@ internal enum Gzip {
     }()
 
     static func crc32(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xFFFF_FFFF
+        crc32Update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF
+    }
+
+    /// Folds `data` into a running CRC-32. The caller supplies the initial
+    /// `0xFFFF_FFFF` and applies the final inversion, so a checksum can be
+    /// accumulated across streamed chunks.
+    private static func crc32Update(_ crc: UInt32, _ data: Data) -> UInt32 {
+        guard !data.isEmpty else { return crc }
+        var value = crc
         data.withUnsafeBytes { raw in
             for byte in raw.bindMemory(to: UInt8.self) {
-                crc = crcTable[Int((crc ^ UInt32(byte)) & 0xFF)] ^ (crc >> 8)
+                value = crcTable[Int((value ^ UInt32(byte)) & 0xFF)] ^ (value >> 8)
             }
         }
-        return crc ^ 0xFFFF_FFFF
+        return value
     }
 }
 #endif

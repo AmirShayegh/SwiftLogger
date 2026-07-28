@@ -177,6 +177,88 @@ extension AllLoggerTests {
             #expect(String(data: decompressed, encoding: .utf8) == original)
         }
 
+        /// Round-trips `url` through the system gunzip and returns the bytes.
+        private func gunzip(_ url: URL) throws -> Data {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/gunzip")
+            process.arguments = ["-c", url.path]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            try process.run()
+            let decompressed = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            #expect(process.terminationStatus == 0)
+            return decompressed
+        }
+
+        @Test func compressFileRoundTripsThroughTheSystemGunzip() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+
+            // Comfortably more than the 64 KB chunk size, so the streaming
+            // encoder has to carry state across several reads and the CRC has
+            // to accumulate across them. A single-chunk input would not
+            // exercise either.
+            let original = (0..<4_000)
+                .map { " INFO | 12:15:30.842 | File.swift:\($0) | streamed message number \($0)" }
+                .joined(separator: "\n")
+            let raw = Data(original.utf8)
+            #expect(raw.count > 64 * 1024)
+
+            let source = dir.appendingPathComponent("big.log")
+            try raw.write(to: source)
+            let gzURL = dir.appendingPathComponent("big.log.gz")
+
+            #expect(Gzip.compressFile(at: source, to: gzURL))
+
+            let produced = try Data(contentsOf: gzURL)
+            #expect(produced[0] == 0x1f && produced[1] == 0x8b && produced[2] == 0x08)
+            #expect(produced.count < raw.count)
+            #expect(try gunzip(gzURL) == raw)
+        }
+
+        @Test func compressFileMatchesTheInMemoryEncoderOnSmallInput() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+
+            // Both encoders must produce containers gunzip reads back
+            // identically — the streaming trailer computes its CRC and length
+            // incrementally, so a divergence here would mean silent corruption.
+            let cases = [
+                "",
+                "x",
+                "short line\n",
+                String(repeating: "ab", count: 5_000),
+                // Exactly one and exactly two chunk-sized inputs: the read loop
+                // then takes an extra empty read to learn it is done, which is
+                // where a finalize-on-the-wrong-pass bug would show up.
+                String(repeating: "c", count: 64 * 1024),
+                String(repeating: "d", count: 128 * 1024),
+            ]
+            for text in cases {
+                let raw = Data(text.utf8)
+                let source = dir.appendingPathComponent("probe-\(raw.count).log")
+                try raw.write(to: source)
+                let gzURL = dir.appendingPathComponent("probe-\(raw.count).log.gz")
+
+                #expect(Gzip.compressFile(at: source, to: gzURL))
+                #expect(try gunzip(gzURL) == raw)
+            }
+        }
+
+        @Test func compressFileFailureLeavesNoPartialOutput() throws {
+            let dir = try makeTempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+
+            let missing = dir.appendingPathComponent("does-not-exist.log")
+            let gzURL = dir.appendingPathComponent("does-not-exist.log.gz")
+
+            #expect(!Gzip.compressFile(at: missing, to: gzURL))
+            // A half-written .gz that pruning later counted as a real archive
+            // would be worse than no archive at all.
+            #expect(!FileManager.default.fileExists(atPath: gzURL.path))
+        }
+
         @Test func gzipHandlesEmptyAndTinyInput() throws {
             let empty = try #require(Gzip.compress(Data()))
             #expect(empty[0] == 0x1f && empty[1] == 0x8b)
